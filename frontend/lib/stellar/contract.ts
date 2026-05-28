@@ -449,4 +449,21 @@ export const contractClient = {
       throw err;
     });
   },
+
+  async getProvenanceRoot(productId: string, callerAddress: string): Promise<Uint8Array> {
+    const simulated = await buildAndSimulateTransaction({
+      method: 'get_provenance_root',
+      args: [productId],
+      callerAddress,
+    });
+
+    if (rpc.Api.isSimulationSuccess(simulated)) {
+      const raw = scValToNative(simulated.result!.retval);
+      if (raw instanceof Uint8Array) return raw;
+      if (Buffer.isBuffer(raw)) return new Uint8Array(raw);
+      if (Array.isArray(raw)) return new Uint8Array(raw);
+      return new Uint8Array(32);
+    }
+    throw new Error('Failed to get provenance root');
+  },
 };

@@ -1,9 +1,5 @@
 #![no_std]
-use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Bytes, Env, String, Vec, Symbol,
-};
-use soroban_sdk::xdr::ToXdr;
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, Env, String, Vec, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, Bytes, BytesN, Env, String, Vec, Symbol};
 
 /// Current event schema version.
 ///
@@ -1388,6 +1384,17 @@ o            actor: caller,
             env.storage()
                 .persistent()
                 .set(&DataKey::Events(product_id.clone()), &events);
+
+            // Update provenance root
+            let prev_root: BytesN<32> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ProvenanceRoot(product_id.clone()))
+                .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]));
+            let new_root = Self::compute_next_provenance_root(&env, &prev_root, &pending_event.event);
+            env.storage()
+                .persistent()
+                .set(&DataKey::ProvenanceRoot(product_id.clone()), &new_root);
 
             // Remove from pending
             pending.remove(event_index);
