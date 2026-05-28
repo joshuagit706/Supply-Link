@@ -81,6 +81,8 @@ import {
 } from '@stellar/stellar-sdk';
 import { signTransaction } from './client';
 import { NETWORK_PASSPHRASE, RPC_URL, CONTRACT_ID, getNetwork } from './client';
+import { withContractRetry, withContractWriteRetry } from '@/lib/resilience';
+import { recordDependency, recordOperation } from '@/lib/api/metrics';
 
 const server = new rpc.Server(RPC_URL);
 
@@ -184,11 +186,23 @@ export const contractClient = {
     owner: string,
     callerAddress: string,
   ): Promise<string> {
-    return buildSignAndSubmitTransaction({
-      method: 'register_product',
-      args: [productId, name, origin, new Address(owner)],
-      callerAddress,
-    });
+    return withContractWriteRetry(() =>
+      buildSignAndSubmitTransaction({
+        method: 'register_product',
+        args: [productId, name, origin, new Address(owner)],
+        callerAddress,
+      }),
+    )
+      .then((hash) => {
+        recordDependency('soroban-rpc', true);
+        recordOperation('product.register', 'success');
+        return hash;
+      })
+      .catch((err) => {
+        recordDependency('soroban-rpc', false);
+        recordOperation('product.register', 'failure');
+        throw err;
+      });
   },
 
   async addTrackingEvent(
@@ -198,37 +212,63 @@ export const contractClient = {
     metadata: string,
     callerAddress: string,
   ): Promise<string> {
-    return buildSignAndSubmitTransaction({
-      method: 'add_tracking_event',
-      args: [productId, location, eventType, metadata],
-      callerAddress,
-    });
+    return withContractWriteRetry(() =>
+      buildSignAndSubmitTransaction({
+        method: 'add_tracking_event',
+        args: [productId, location, eventType, metadata],
+        callerAddress,
+      }),
+    )
+      .then((hash) => {
+        recordDependency('soroban-rpc', true);
+        recordOperation('event.create', 'success');
+        return hash;
+      })
+      .catch((err) => {
+        recordDependency('soroban-rpc', false);
+        recordOperation('event.create', 'failure');
+        throw err;
+      });
   },
 
   async getProduct(productId: string, callerAddress: string): Promise<any> {
-    const simulated = await buildAndSimulateTransaction({
-      method: 'get_product',
-      args: [productId],
-      callerAddress,
+    return withContractRetry(async () => {
+      const simulated = await buildAndSimulateTransaction({
+        method: 'get_product',
+        args: [productId],
+        callerAddress,
+      });
+      if (rpc.Api.isSimulationSuccess(simulated)) {
+        recordDependency('soroban-rpc', true);
+        recordOperation('product.verify', 'success');
+        return scValToNative(simulated.result!.retval);
+      }
+      throw new Error('Failed to get product');
+    }).catch((err) => {
+      recordDependency('soroban-rpc', false);
+      recordOperation('product.verify', 'failure');
+      throw err;
     });
-
-    if (rpc.Api.isSimulationSuccess(simulated)) {
-      return scValToNative(simulated.result!.retval);
-    }
-    throw new Error('Failed to get product');
   },
 
   async getTrackingEvents(productId: string, callerAddress: string): Promise<any[]> {
-    const simulated = await buildAndSimulateTransaction({
-      method: 'get_tracking_events',
-      args: [productId],
-      callerAddress,
+    return withContractRetry(async () => {
+      const simulated = await buildAndSimulateTransaction({
+        method: 'get_tracking_events',
+        args: [productId],
+        callerAddress,
+      });
+      if (rpc.Api.isSimulationSuccess(simulated)) {
+        recordDependency('soroban-rpc', true);
+        recordOperation('event.fetch', 'success');
+        return scValToNative(simulated.result!.retval) || [];
+      }
+      throw new Error('Failed to get tracking events');
+    }).catch((err) => {
+      recordDependency('soroban-rpc', false);
+      recordOperation('event.fetch', 'failure');
+      throw err;
     });
-
-    if (rpc.Api.isSimulationSuccess(simulated)) {
-      return scValToNative(simulated.result!.retval) || [];
-    }
-    throw new Error('Failed to get tracking events');
   },
 
   async transferOwnership(
@@ -236,11 +276,21 @@ export const contractClient = {
     newOwner: string,
     callerAddress: string,
   ): Promise<string> {
-    return buildSignAndSubmitTransaction({
-      method: 'transfer_ownership',
-      args: [productId, new Address(newOwner)],
-      callerAddress,
-    });
+    return withContractWriteRetry(() =>
+      buildSignAndSubmitTransaction({
+        method: 'transfer_ownership',
+        args: [productId, new Address(newOwner)],
+        callerAddress,
+      }),
+    )
+      .then((hash) => {
+        recordDependency('soroban-rpc', true);
+        return hash;
+      })
+      .catch((err) => {
+        recordDependency('soroban-rpc', false);
+        throw err;
+      });
   },
 
   async addAuthorizedActor(
@@ -248,11 +298,21 @@ export const contractClient = {
     actor: string,
     callerAddress: string,
   ): Promise<string> {
-    return buildSignAndSubmitTransaction({
-      method: 'add_authorized_actor',
-      args: [productId, new Address(actor)],
-      callerAddress,
-    });
+    return withContractWriteRetry(() =>
+      buildSignAndSubmitTransaction({
+        method: 'add_authorized_actor',
+        args: [productId, new Address(actor)],
+        callerAddress,
+      }),
+    )
+      .then((hash) => {
+        recordDependency('soroban-rpc', true);
+        return hash;
+      })
+      .catch((err) => {
+        recordDependency('soroban-rpc', false);
+        throw err;
+      });
   },
 
   async removeAuthorizedActor(
@@ -260,19 +320,94 @@ export const contractClient = {
     actor: string,
     callerAddress: string,
   ): Promise<string> {
+    return withContractWriteRetry(() =>
+      buildSignAndSubmitTransaction({
+        method: 'remove_authorized_actor',
+        args: [productId, new Address(actor)],
+        callerAddress,
+      }),
+    )
+      .then((hash) => {
+        recordDependency('soroban-rpc', true);
+        return hash;
+      })
+      .catch((err) => {
+        recordDependency('soroban-rpc', false);
+        throw err;
+      });
+  },
+
+  async getNonce(actor: string, callerAddress: string): Promise<number> {
+    const simulated = await buildAndSimulateTransaction({
+      method: 'get_nonce',
+      args: [new Address(actor)],
+      callerAddress,
+    });
+
+    if (rpc.Api.isSimulationSuccess(simulated)) {
+      return Number(scValToNative(simulated.result!.retval) ?? 0);
+    }
+    throw new Error('Failed to get nonce');
+  },
+
+  async approveEvent(
+    productId: string,
+    pendingEventId: number,
+    approver: string,
+    callerAddress: string,
+  ): Promise<string> {
+    const nonce = await contractClient.getNonce(approver, callerAddress);
     return buildSignAndSubmitTransaction({
-      method: 'remove_authorized_actor',
-      args: [productId, new Address(actor)],
+      method: 'approve_event',
+      args: [productId, pendingEventId, new Address(approver), nonce],
       callerAddress,
     });
   },
 
-  async deactivateProduct(productId: string, callerAddress: string): Promise<string> {
+  async rejectEvent(
+    productId: string,
+    pendingEventId: number,
+    rejector: string,
+    reason: string,
+    callerAddress: string,
+  ): Promise<string> {
+    const nonce = await contractClient.getNonce(rejector, callerAddress);
     return buildSignAndSubmitTransaction({
-      method: 'deactivate_product',
+      method: 'reject_event',
+      args: [productId, pendingEventId, new Address(rejector), reason, nonce],
+      callerAddress,
+    });
+  },
+
+  async getPendingEvents(productId: string, callerAddress: string): Promise<any[]> {
+    const simulated = await buildAndSimulateTransaction({
+      method: 'get_pending_events',
       args: [productId],
       callerAddress,
     });
+
+    if (rpc.Api.isSimulationSuccess(simulated)) {
+      return scValToNative(simulated.result!.retval) || [];
+    }
+    throw new Error('Failed to get pending events');
+  },
+
+  async deactivateProduct(productId: string, callerAddress: string): Promise<string> {
+    return withContractWriteRetry(() =>
+      buildSignAndSubmitTransaction({
+        method: 'deactivate_product',
+        args: [productId],
+        callerAddress,
+      }),
+    )
+      .then((hash) => {
+        recordDependency('soroban-rpc', true);
+        return hash;
+      })
+      .catch((err) => {
+        recordDependency('soroban-rpc', false);
+        throw err;
+      });
   },
 
   async listProducts(
@@ -280,29 +415,39 @@ export const contractClient = {
     pageSize: number = 20,
     callerAddress: string,
   ): Promise<any[]> {
-    const simulated = await buildAndSimulateTransaction({
-      method: 'list_products',
-      args: [page, pageSize],
-      callerAddress,
+    return withContractRetry(async () => {
+      const simulated = await buildAndSimulateTransaction({
+        method: 'list_products',
+        args: [page, pageSize],
+        callerAddress,
+      });
+      if (rpc.Api.isSimulationSuccess(simulated)) {
+        recordDependency('soroban-rpc', true);
+        return scValToNative(simulated.result!.retval) || [];
+      }
+      throw new Error('Failed to list products');
+    }).catch((err) => {
+      recordDependency('soroban-rpc', false);
+      throw err;
     });
-
-    if (rpc.Api.isSimulationSuccess(simulated)) {
-      return scValToNative(simulated.result!.retval) || [];
-    }
-    throw new Error('Failed to list products');
   },
 
   async getProductCount(callerAddress: string): Promise<number> {
-    const simulated = await buildAndSimulateTransaction({
-      method: 'get_product_count',
-      args: [],
-      callerAddress,
+    return withContractRetry(async () => {
+      const simulated = await buildAndSimulateTransaction({
+        method: 'get_product_count',
+        args: [],
+        callerAddress,
+      });
+      if (rpc.Api.isSimulationSuccess(simulated)) {
+        recordDependency('soroban-rpc', true);
+        return scValToNative(simulated.result!.retval) || 0;
+      }
+      throw new Error('Failed to get product count');
+    }).catch((err) => {
+      recordDependency('soroban-rpc', false);
+      throw err;
     });
-
-    if (rpc.Api.isSimulationSuccess(simulated)) {
-      return scValToNative(simulated.result!.retval) || 0;
-    }
-    throw new Error('Failed to get product count');
   },
 
   async getProvenanceRoot(productId: string, callerAddress: string): Promise<Uint8Array> {

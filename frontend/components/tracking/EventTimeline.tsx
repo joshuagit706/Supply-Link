@@ -1,4 +1,4 @@
-"use client";
+'use client';
 
 import { useState, useMemo } from "react";
 import type { TrackingEvent, EventType, EventFilter } from "@/lib/types";
@@ -26,7 +26,7 @@ function MetadataViewer({ raw }: { raw: string }) {
   if (!parsed || Object.keys(parsed).length === 0) return null;
 
   const { attachmentUrl, ...rest } = parsed as Record<string, unknown>;
-  const attachmentHref = typeof attachmentUrl === "string" ? attachmentUrl : null;
+  const attachmentHref = typeof attachmentUrl === 'string' ? attachmentUrl : null;
   const hasOtherKeys = Object.keys(rest).length > 0;
 
   return (
@@ -56,7 +56,6 @@ function MetadataViewer({ raw }: { raw: string }) {
           View attachment
         </a>
       )}
-
       {hasOtherKeys && (
         <>
           <button
@@ -64,7 +63,7 @@ function MetadataViewer({ raw }: { raw: string }) {
             className="flex items-center gap-1 text-xs text-[var(--muted)] hover:text-[var(--foreground)] transition-colors w-fit"
           >
             {open ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
-            {open ? "Hide" : "Show"} metadata
+            {open ? 'Hide' : 'Show'} metadata
           </button>
           {open && (
             <pre className="text-xs bg-[var(--muted-bg)] text-[var(--muted)] rounded-md px-3 py-2 overflow-x-auto">

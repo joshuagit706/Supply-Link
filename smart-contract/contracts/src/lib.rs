@@ -10,10 +10,12 @@ use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, 
 /// | Version | Changes |
 /// |---------|---------|
 /// | 1       | Initial versioned schema. Adds `schema_version` field. |
-pub const EVENT_SCHEMA_VERSION: u32 = 1;
+/// | 2       | Adds `metadata_commitment` and `private_metadata` fields for privacy-preserving (off-chain encrypted) metadata. |
+pub const EVENT_SCHEMA_VERSION: u32 = 2;
 
 mod tests;
 mod resilience_tests;
+mod compliance_tests;
 
 // ── Payload size limits (issue #311) ─────────────────────────────────────────
 // All limits are in bytes (Soroban String::len() returns byte count).
@@ -29,6 +31,9 @@ const MAX_NAME_LEN:     u32 = 256;
 const MAX_ORIGIN_LEN:   u32 = 256;
 const MAX_LOCATION_LEN: u32 = 256;
 const MAX_METADATA_LEN: u32 = 4096;
+// Privacy commitment (issue #409): a hex-encoded hash of the off-chain encrypted
+// payload. A SHA-256 hex digest is 64 chars; allow headroom for other digests.
+const MAX_COMMITMENT_LEN: u32 = 128;
 
 // ── Event expiration policy (issue #314) ──────────────────────────────────────
 /// Pending events expire after this many seconds (7 days).
@@ -50,6 +55,34 @@ pub enum Error {
     OwnerOnly = 5,
     PendingEventExpired = 6,
     InvalidNonce = 7,
+    ComplianceViolation = 8,
+}
+
+// ── Compliance rule types ─────────────────────────────────────────────────────
+pub const COMPLIANCE_REQUIRED_ORDER: u32 = 0;
+pub const COMPLIANCE_MANDATORY_INSPECTION: u32 = 1;
+pub const COMPLIANCE_MAX_TIME_BETWEEN_STAGES: u32 = 2;
+
+/// A single compliance rule constraining event sequencing for a product.
+#[contracttype]
+#[derive(Clone)]
+pub struct ComplianceRule {
+    /// Rule kind: 0=RequiredOrder, 1=MandatoryInspection, 2=MaxTimeBetweenStages.
+    pub rule_type: u32,
+    /// Preceding stage that must have occurred (for types 0 and 1).
+    pub from_stage: String,
+    /// Stage this rule guards (the event type being submitted).
+    pub to_stage: String,
+    /// Max seconds allowed between from_stage and to_stage (for type 2).
+    pub max_seconds: u64,
+}
+
+/// Per-product compliance policy: a collection of rules enforced on every event.
+#[contracttype]
+#[derive(Clone)]
+pub struct CompliancePolicy {
+    pub product_id: String,
+    pub rules: Vec<ComplianceRule>,
 }
 
 // ── Data models ──────────────────────────────────────────────────────────────
@@ -99,6 +132,37 @@ pub struct Product {
     /// and can receive tracking events. `false` indicates the product has been
     /// deactivated and is read-only. Defaults to `true` on registration.
     pub active: bool,
+    /// Taxonomy category ID for this product (e.g. `"agricultural"`). (#425)
+    /// Must be a recognised category from the controlled vocabulary.
+    pub category: String,
+    /// Taxonomy subcategory ID within `category` (e.g. `"coffee"`). (#425)
+    pub subcategory: String,
+}
+
+/// A product certification issued by an authorised actor. (#428)
+///
+/// Certifications are stored as a `Vec<ProductCertification>` under
+/// [`DataKey::Certifications`] keyed by `product_id`. Each entry carries
+/// the issuer address, a string certification type from the controlled
+/// vocabulary (e.g. `"fair_trade"`, `"organic"`), and a revocation flag.
+#[contracttype]
+#[derive(Clone)]
+pub struct ProductCertification {
+    /// Stable unique identifier for this certification entry.
+    pub id: String,
+    /// ID of the product this certification belongs to.
+    pub product_id: String,
+    /// Certification type key (e.g. `"fair_trade"`, `"organic"`, `"iso_9001"`).
+    pub cert_type: String,
+    /// Stellar address of the actor who issued this certification.
+    /// Must be the product owner or an authorized actor at issuance time.
+    pub issuer: Address,
+    /// Ledger timestamp when the certification was issued.
+    pub issued_at: u64,
+    /// `true` if this certification has been revoked; `false` otherwise.
+    pub revoked: bool,
+    /// Ledger timestamp when the certification was revoked (0 if not revoked).
+    pub revoked_at: u64,
 }
 
 /// A single supply-chain event recorded against a [`Product`].
@@ -144,6 +208,11 @@ pub struct TrackingEvent {
     /// Arbitrary JSON string carrying stage-specific metadata
     /// (e.g. `{"temperature":"4°C","humidity":"60%"}`). The contract stores
     /// this opaquely; consumers are responsible for parsing it.
+    ///
+    /// For privacy-preserving events (see `private_metadata`) this field is an
+    /// **empty string**: the plaintext is never written on-chain. The encrypted
+    /// payload lives off-chain and only its hash is recorded in
+    /// `metadata_commitment`.
     pub metadata: String,
     /// Stable deterministic event ID — a hex-encoded SHA-256 hash of the
     /// canonical fields: `product_id|actor|event_type|timestamp|metadata`.
@@ -235,6 +304,19 @@ pub struct EventRejection {
     pub reason: String,
     /// Timestamp of the rejection.
     pub timestamp: u64,
+    pub event_type: String, // HARVEST | PROCESSING | SHIPPING | RETAIL | SPOILED | EXPIRED
+    pub metadata: String,   // JSON string
+}
+
+/// A batch/lot grouping multiple product IDs together. (#405)
+#[contracttype]
+#[derive(Clone)]
+pub struct Batch {
+    pub id: String,
+    pub name: String,
+    pub owner: Address,
+    pub product_ids: Vec<String>,
+    pub timestamp: u64,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -256,6 +338,10 @@ pub enum DataKey {
     Product(String),
     /// Key for the event log of a product. The inner `String` is the product ID.
     Events(String),
+    /// Batch entity keyed by batch ID. (#405)
+    Batch(String),
+    /// Aggregate events recorded at the batch level. (#405)
+    BatchEvents(String),
     /// Key for pending events awaiting multi-signature approval.
     /// The inner `String` is the product ID.
     PendingEvents(String),
@@ -272,10 +358,8 @@ pub enum DataKey {
     AuthPolicy(String),
     /// Key for actor nonce tracking. The inner `Address` is the actor address.
     ActorNonce(Address),
-    /// Key for the provenance root of a product's event history.
-    /// Stores a `BytesN<32>` SHA-256 chain hash, updated each time a tracking
-    /// event is finalized. Used by clients to verify event-list integrity.
-    ProvenanceRoot(String),
+    /// Key for the compliance policy of a product. The inner `String` is the product ID.
+    CompliancePolicy(String),
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -301,6 +385,8 @@ pub struct SupplyLinkContract;
 
 #[contractimpl]
 impl SupplyLinkContract {
+    // ── Product registration ──────────────────────────────────────────────────
+
     /// Register a new product on-chain.
     ///
     /// Creates a [`Product`] entry in persistent storage and initialises the
@@ -347,6 +433,8 @@ impl SupplyLinkContract {
         origin: String,
         owner: Address,
         required_signatures: u32,
+        category: String,
+        subcategory: String,
     ) -> Product {
         // Duplicate guard — must come before auth to avoid leaking state on
         // duplicate attempts and to keep counter/index consistent.
@@ -356,9 +444,11 @@ impl SupplyLinkContract {
 
         owner.require_auth();
         // Issue #311: enforce size limits.
-        assert_len(&id,     MAX_ID_LEN,     "id");
-        assert_len(&name,   MAX_NAME_LEN,   "name");
-        assert_len(&origin, MAX_ORIGIN_LEN, "origin");
+        assert_len(&id,          MAX_ID_LEN,     "id");
+        assert_len(&name,        MAX_NAME_LEN,   "name");
+        assert_len(&origin,      MAX_ORIGIN_LEN, "origin");
+        assert_len(&category,    64,             "category");
+        assert_len(&subcategory, 64,             "subcategory");
         let product = Product {
             id: id.clone(),
             name,
@@ -366,8 +456,12 @@ impl SupplyLinkContract {
             owner,
             timestamp: env.ledger().timestamp(),
             authorized_actors: Vec::new(&env),
+            expiration_timestamp: 0,
+            spoiled: false,
             required_signatures,
             active: true,
+            category,
+            subcategory,
         };
         env.storage()
             .persistent()
@@ -483,24 +577,106 @@ o            actor: caller,
             stable_id,
         };
 
-        // Check if multi-signature is required
+        Self::record_event(&env, &product, event.clone());
+
+        Ok(event)
+    }
+
+    /// Add a tracking event whose metadata is private (issue #409).
+    ///
+    /// Identical to [`Self::add_tracking_event`] except the plaintext metadata is
+    /// **never** written on-chain. The caller encrypts the sensitive metadata
+    /// off-chain, stores the ciphertext off-chain, and submits only a
+    /// `metadata_commitment` — a hex-encoded hash of that ciphertext. The stored
+    /// event has `private_metadata = true` and an empty `metadata` field.
+    ///
+    /// This preserves provable provenance (anyone can hash the off-chain payload
+    /// and compare it against the on-chain commitment) while keeping the contents
+    /// confidential: the commitment is a one-way hash, so the plaintext cannot be
+    /// recovered from on-chain data alone.
+    ///
+    /// # Parameters
+    /// - `metadata_commitment` — Hex-encoded hash of the off-chain encrypted
+    ///   payload. Must be non-empty and at most `MAX_COMMITMENT_LEN` bytes.
+    ///
+    /// # Authorization
+    /// Identical to [`Self::add_tracking_event`].
+    ///
+    /// # Panics
+    /// - `"commitment required for private metadata"` — if `metadata_commitment` is empty.
+    /// - `"metadata_commitment exceeds max length"` — if the commitment is too long.
+    ///
+    /// # Errors
+    /// - [`Error::ProductNotFound`] — if `product_id` is not registered.
+    /// - [`Error::NotAuthorized`] — if `caller` is neither owner nor authorized actor.
+    pub fn add_private_tracking_event(
+        env: Env,
+        product_id: String,
+        caller: Address,
+        location: String,
+        event_type: String,
+        metadata_commitment: String,
+    ) -> Result<TrackingEvent, Error> {
+        let product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .ok_or(Error::ProductNotFound)?;
+
+        let is_owner = product.owner == caller;
+        let is_actor = product.authorized_actors.contains(&caller);
+        if !is_owner && !is_actor {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+
+        assert_len(&location, MAX_LOCATION_LEN, "location");
+        if metadata_commitment.len() == 0 {
+            panic!("commitment required for private metadata");
+        }
+        assert_len(&metadata_commitment, MAX_COMMITMENT_LEN, "metadata_commitment");
+
+        let event = TrackingEvent {
+            schema_version: EVENT_SCHEMA_VERSION,
+            product_id: product_id.clone(),
+            location,
+            actor: caller.clone(),
+            timestamp: env.ledger().timestamp(),
+            event_type,
+            // Plaintext is NEVER stored on-chain for private events.
+            metadata: String::from_str(&env, ""),
+            metadata_commitment,
+            private_metadata: true,
+        };
+
+        Self::record_event(&env, &product, event.clone());
+
+        Ok(event)
+    }
+
+    /// Append a finalized event, or stage it for multi-signature approval, then
+    /// emit the matching event. Shared by [`Self::add_tracking_event`] and
+    /// [`Self::add_private_tracking_event`].
+    fn record_event(env: &Env, product: &Product, event: TrackingEvent) {
+        let product_id = event.product_id.clone();
+        let event_type = event.event_type.clone();
+
         if product.required_signatures > 1 {
             // Stage event as pending with a stable ID
             let mut pending: Vec<PendingEvent> = env
                 .storage()
                 .persistent()
                 .get(&DataKey::PendingEvents(product_id.clone()))
-                .unwrap_or_else(|| Vec::new(&env));
+                .unwrap_or_else(|| Vec::new(env));
 
-            // Generate next stable pending event ID
             let next_id: u64 = env
                 .storage()
                 .persistent()
                 .get(&DataKey::NextPendingId(product_id.clone()))
                 .unwrap_or(0u64);
 
-            let mut approvals = Vec::new(&env);
-            approvals.push_back(caller);
+            let mut approvals = Vec::new(env);
+            approvals.push_back(event.actor.clone());
 
             let pending_event = PendingEvent {
                 pending_event_id: next_id,
@@ -517,48 +693,31 @@ o            actor: caller,
                 .persistent()
                 .set(&DataKey::PendingEvents(product_id.clone()), &pending);
 
-            // Increment the ID counter for next pending event
             env.storage()
                 .persistent()
                 .set(&DataKey::NextPendingId(product_id.clone()), &(next_id + 1));
 
-            // Emit pending event
             env.events().publish(
-                (Symbol::new(&env, "event_pending"), product_id, event_type, EVENT_SCHEMA_VERSION),
-                event.clone(),
+                (Symbol::new(env, "event_pending"), product_id, event_type, EVENT_SCHEMA_VERSION),
+                event,
             );
         } else {
-            // Immediately finalize event
             let mut events: Vec<TrackingEvent> = env
                 .storage()
                 .persistent()
                 .get(&DataKey::Events(product_id.clone()))
-                .unwrap_or_else(|| Vec::new(&env));
+                .unwrap_or_else(|| Vec::new(env));
 
             events.push_back(event.clone());
             env.storage()
                 .persistent()
                 .set(&DataKey::Events(product_id.clone()), &events);
 
-            // Update provenance root
-            let prev_root: BytesN<32> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::ProvenanceRoot(product_id.clone()))
-                .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]));
-            let new_root = Self::compute_next_provenance_root(&env, &prev_root, &event);
-            env.storage()
-                .persistent()
-                .set(&DataKey::ProvenanceRoot(product_id.clone()), &new_root);
-
-            // Emit event
             env.events().publish(
-                (Symbol::new(&env, "event_added"), product_id, event_type, EVENT_SCHEMA_VERSION),
-                event.clone(),
+                (Symbol::new(env, "event_added"), product_id, event_type, EVENT_SCHEMA_VERSION),
+                event,
             );
         }
-
-        Ok(event)
     }
 
     /// Retrieve a product by its ID.
@@ -599,6 +758,9 @@ o            actor: caller,
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Transfer product ownership.
+    /// Panics if the product is spoiled — spoiled products cannot be transferred.
+    pub fn transfer_ownership(env: Env, product_id: String, new_owner: Address) -> bool {
     /// Check whether a product ID is registered.
     ///
     /// Useful for pre-flight checks before calling functions that panic on
@@ -690,7 +852,16 @@ o            actor: caller,
             .get(&DataKey::Product(product_id.clone()))
             .ok_or(Error::ProductNotFound)?;
 
+        if product.spoiled {
+            panic!("spoiled product cannot be transferred");
+        }
+
         product.owner.require_auth();
+
+        if product.owner == new_owner {
+            panic!("new owner must differ from current owner");
+        }
+
         Self::validate_and_increment_nonce(&env, &product.owner, nonce);
         
         product.owner = new_owner.clone();
@@ -703,6 +874,7 @@ o            actor: caller,
             new_owner,
         );
 
+        true
         Ok(true)
     }
 
@@ -1687,58 +1859,105 @@ fn compute_stable_id(
         pending.get(event_index).unwrap().pending_event_id
     }
 
-    /// Return the current provenance root for a product's event history.
+    /// Store or replace the compliance policy for a product.
     ///
-    /// The provenance root is a SHA-256 hash chain over all finalized tracking
-    /// events for the product. It is updated atomically whenever a new event is
-    /// finalized (either directly or through multi-sig approval).
-    ///
-    /// Clients can verify the integrity of a locally-cached event list by
-    /// recomputing the chain hash from the events and comparing the result with
-    /// the value returned here. Any insertion, deletion, or modification of an
-    /// event will produce a different root and fail the comparison.
-    ///
-    /// # Returns
-    /// A `BytesN<32>` chain hash, or 32 zero bytes if no events have been
-    /// finalized yet.
-    ///
-    /// # Authorization
-    /// None — this is a read-only function.
-    pub fn get_provenance_root(env: Env, product_id: String) -> BytesN<32> {
+    /// Only the product owner may call this function. Each rule in the policy
+    /// is enforced on every subsequent `add_tracking_event` call.
+    pub fn set_compliance_policy(
+        env: Env,
+        product_id: String,
+        rules: Vec<ComplianceRule>,
+    ) -> Result<CompliancePolicy, Error> {
+        let product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .ok_or(Error::ProductNotFound)?;
+
+        product.owner.require_auth();
+
+        let policy = CompliancePolicy {
+            product_id: product_id.clone(),
+            rules,
+        };
+
         env.storage()
             .persistent()
-            .get(&DataKey::ProvenanceRoot(product_id))
-            .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]))
+            .set(&DataKey::CompliancePolicy(product_id.clone()), &policy);
+
+        env.events().publish(
+            (Symbol::new(&env, "compliance_policy_set"), product_id),
+            policy.clone(),
+        );
+
+        Ok(policy)
     }
 
-    /// Compute the next provenance root by chaining the previous root with the
-    /// content hash of a newly finalized event.
-    ///
-    /// Hash input layout (all big-endian):
-    /// ```text
-    /// prev_root (32)             SHA-256 hash of preceding state
-    /// sha256(event_type) (32)    content commitment: event type
-    /// sha256(location) (32)      content commitment: location
-    /// sha256(metadata) (32)      content commitment: metadata
-    /// sha256(product_id) (32)    content commitment: product identifier
-    /// timestamp (8)              u64 big-endian ledger timestamp
-    /// schema_version (4)         u32 big-endian schema version
-    /// ```
-    fn compute_next_provenance_root(env: &Env, prev_root: &BytesN<32>, event: &TrackingEvent) -> BytesN<32> {
-        let et_hash  = env.crypto().sha256(&event.event_type.to_bytes());
-        let loc_hash = env.crypto().sha256(&event.location.to_bytes());
-        let meta_hash = env.crypto().sha256(&event.metadata.to_bytes());
-        let pid_hash = env.crypto().sha256(&event.product_id.to_bytes());
+    /// Retrieve the compliance policy for a product, if one has been set.
+    pub fn get_compliance_policy(env: Env, product_id: String) -> Option<CompliancePolicy> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CompliancePolicy(product_id))
+    }
 
-        let mut input = Bytes::from_slice(env, &prev_root.to_array());
-        input.append(&Bytes::from_slice(env, &et_hash.to_array()));
-        input.append(&Bytes::from_slice(env, &loc_hash.to_array()));
-        input.append(&Bytes::from_slice(env, &meta_hash.to_array()));
-        input.append(&Bytes::from_slice(env, &pid_hash.to_array()));
-        input.append(&Bytes::from_slice(env, &event.timestamp.to_be_bytes()));
-        input.append(&Bytes::from_slice(env, &event.schema_version.to_be_bytes()));
+    fn check_compliance(
+        env: &Env,
+        product_id: &String,
+        event_type: &String,
+        current_time: u64,
+    ) -> Result<(), Error> {
+        let policy: CompliancePolicy = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::CompliancePolicy(product_id.clone()))
+        {
+            Some(p) => p,
+            None => return Ok(()),
+        };
 
-        env.crypto().sha256(&input)
+        let events: Vec<TrackingEvent> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Events(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+
+        for i in 0..policy.rules.len() {
+            let rule = policy.rules.get(i).unwrap();
+
+            if rule.to_stage != *event_type {
+                continue;
+            }
+
+            if rule.rule_type == COMPLIANCE_REQUIRED_ORDER
+                || rule.rule_type == COMPLIANCE_MANDATORY_INSPECTION
+            {
+                let mut found = false;
+                for j in 0..events.len() {
+                    if events.get(j).unwrap().event_type == rule.from_stage {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    return Err(Error::ComplianceViolation);
+                }
+            } else if rule.rule_type == COMPLIANCE_MAX_TIME_BETWEEN_STAGES {
+                let mut last_from_time: Option<u64> = None;
+                for j in 0..events.len() {
+                    let ev = events.get(j).unwrap();
+                    if ev.event_type == rule.from_stage {
+                        last_from_time = Some(ev.timestamp);
+                    }
+                }
+                if let Some(last_time) = last_from_time {
+                    if current_time > last_time + rule.max_seconds {
+                        return Err(Error::ComplianceViolation);
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn validate_and_increment_nonce(env: &Env, actor: &Address, provided_nonce: u64) {
@@ -1755,6 +1974,141 @@ fn compute_stable_id(
         env.storage()
             .persistent()
             .set(&DataKey::ActorNonce(actor.clone()), &(current_nonce + 1));
+    }
+
+    /// Issue a certification for a product. (#428)
+    ///
+    /// Stores a [`ProductCertification`] entry for the given product. Only the
+    /// product owner or an authorized actor may call this function.
+    ///
+    /// # Parameters
+    /// - `product_id` — ID of the product to certify.
+    /// - `caller` — Address of the actor issuing the certification.
+    /// - `cert_id` — Caller-supplied unique identifier for this certification.
+    /// - `cert_type` — Certification type key (e.g. `"fair_trade"`, `"organic"`).
+    ///
+    /// # Authorization
+    /// Requires `caller.require_auth()`. Caller must be owner or authorized actor.
+    pub fn issue_certification(
+        env: Env,
+        product_id: String,
+        caller: Address,
+        cert_id: String,
+        cert_type: String,
+    ) -> ProductCertification {
+        let product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .unwrap_or_else(|| panic!("product not found"));
+
+        let is_owner = product.owner == caller;
+        let is_actor = product.authorized_actors.contains(&caller);
+        if !is_owner && !is_actor {
+            panic!("caller is not authorized");
+        }
+        caller.require_auth();
+        assert_len(&cert_id, 128, "cert_id");
+        assert_len(&cert_type, 64, "cert_type");
+
+        let cert = ProductCertification {
+            id: cert_id.clone(),
+            product_id: product_id.clone(),
+            cert_type,
+            issuer: caller,
+            issued_at: env.ledger().timestamp(),
+            revoked: false,
+            revoked_at: 0,
+        };
+
+        let mut certs: Vec<ProductCertification> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Certifications(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        certs.push_back(cert.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::Certifications(product_id.clone()), &certs);
+
+        env.events().publish(
+            (Symbol::new(&env, "certification_issued"), product_id),
+            cert.clone(),
+        );
+
+        cert
+    }
+
+    /// Revoke a previously issued certification. (#428)
+    ///
+    /// Sets the `revoked` flag on the matching certification entry.
+    /// Only the product owner may revoke a certification.
+    ///
+    /// # Parameters
+    /// - `product_id` — ID of the product whose certification to revoke.
+    /// - `caller` — Must be the product owner.
+    /// - `cert_id` — ID of the certification to revoke.
+    pub fn revoke_certification(
+        env: Env,
+        product_id: String,
+        caller: Address,
+        cert_id: String,
+    ) -> bool {
+        let product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .unwrap_or_else(|| panic!("product not found"));
+
+        if product.owner != caller {
+            panic!("only product owner can revoke certifications");
+        }
+        caller.require_auth();
+
+        let mut certs: Vec<ProductCertification> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Certifications(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut found = false;
+        let mut updated: Vec<ProductCertification> = Vec::new(&env);
+        for cert in certs.iter() {
+            if cert.id == cert_id {
+                let revoked_cert = ProductCertification {
+                    revoked: true,
+                    revoked_at: env.ledger().timestamp(),
+                    ..cert.clone()
+                };
+                updated.push_back(revoked_cert.clone());
+                env.events().publish(
+                    (Symbol::new(&env, "certification_revoked"), product_id.clone()),
+                    revoked_cert,
+                );
+                found = true;
+            } else {
+                updated.push_back(cert.clone());
+            }
+        }
+
+        if found {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Certifications(product_id), &updated);
+        }
+
+        found
+    }
+
+    /// Return all certifications (active and revoked) for a product. (#428)
+    pub fn list_certifications(
+        env: Env,
+        product_id: String,
+    ) -> Vec<ProductCertification> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Certifications(product_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 }
 
@@ -1782,7 +2136,7 @@ mod rejection_reason_tests {
         env.mock_all_auths();
 
         // Register product with multi-sig
-        client.register_product(&product_id, &name, &origin, &owner, &2);
+        client.register_product(&product_id, &name, &origin, &owner, &2, &String::from_str(&env, "other"), &String::from_str(&env, "general"));
         client.add_authorized_actor(&product_id, &actor, &0);
 
         // Add pending event
@@ -1820,7 +2174,7 @@ mod rejection_reason_tests {
         env.mock_all_auths();
 
         // Register product with multi-sig
-        client.register_product(&product_id, &name, &origin, &owner, &2);
+        client.register_product(&product_id, &name, &origin, &owner, &2, &String::from_str(&env, "other"), &String::from_str(&env, "general"));
         client.add_authorized_actor(&product_id, &actor, &0);
 
         // Add pending event
@@ -1853,7 +2207,7 @@ mod rejection_reason_tests {
         env.mock_all_auths();
 
         // Register product with multi-sig
-        client.register_product(&product_id, &name, &origin, &owner, &2);
+        client.register_product(&product_id, &name, &origin, &owner, &2, &String::from_str(&env, "other"), &String::from_str(&env, "general"));
         client.add_authorized_actor(&product_id, &actor, &0);
 
         // Add pending event
@@ -1884,7 +2238,7 @@ mod rejection_reason_tests {
         env.mock_all_auths();
 
         // Register product with multi-sig
-        client.register_product(&product_id, &name, &origin, &owner, &2);
+        client.register_product(&product_id, &name, &origin, &owner, &2, &String::from_str(&env, "other"), &String::from_str(&env, "general"));
         client.add_authorized_actor(&product_id, &actor, &0);
 
         // Add pending event
@@ -1893,6 +2247,329 @@ mod rejection_reason_tests {
         // Reject with max length reason (should work)
         let result = client.reject_event(&product_id, &0, &owner, &max_reason, &1);
         assert_eq!(result, true);
+    }
+
+    /// Remove an authorized actor from a product.
+    pub fn remove_authorized_actor(env: Env, product_id: String, actor: Address) -> bool {
+        let mut product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+
+        product.owner.require_auth();
+
+        let mut new_actors = Vec::new(&env);
+        let mut found = false;
+        for i in 0..product.authorized_actors.len() {
+            let a = product.authorized_actors.get(i).unwrap();
+            if a == actor && !found {
+                found = true;
+            } else {
+                new_actors.push_back(a);
+            }
+        }
+        product.authorized_actors = new_actors;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Product(product_id), &product);
+        found
+    }
+
+    // ── #406: Expiration & spoilage ───────────────────────────────────────────
+
+    /// Set or update the expiration timestamp for a product (owner-only).
+    /// Pass 0 to clear the expiration.
+    pub fn update_expiration(
+        env: Env,
+        product_id: String,
+        expiration_timestamp: u64,
+    ) -> bool {
+        let mut product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+        product.owner.require_auth();
+        product.expiration_timestamp = expiration_timestamp;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Product(product_id.clone()), &product);
+
+        env.events().publish(
+            (Symbol::new(&env, "expiration_updated"), product_id),
+            expiration_timestamp,
+        );
+        true
+    }
+
+    /// Returns true if the product has an expiration set and the ledger
+    /// timestamp has passed it.
+    pub fn is_expired(env: Env, product_id: String) -> bool {
+        let product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id))
+            .expect("product not found");
+        product.expiration_timestamp > 0
+            && env.ledger().timestamp() >= product.expiration_timestamp
+    }
+
+    /// Mark a product as spoiled (owner-only). Records a SPOILED event.
+    /// Spoiled products cannot receive new tracking events or be transferred.
+    pub fn mark_spoiled(
+        env: Env,
+        product_id: String,
+        reason: String,
+    ) -> bool {
+        let mut product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+        product.owner.require_auth();
+
+        if product.spoiled {
+            return true; // idempotent
+        }
+
+        product.spoiled = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Product(product_id.clone()), &product);
+
+        // Record a SPOILED event in the event log
+        let event = TrackingEvent {
+            product_id: product_id.clone(),
+            location: String::from_str(&env, "N/A"),
+            actor: product.owner.clone(),
+            timestamp: env.ledger().timestamp(),
+            event_type: String::from_str(&env, "SPOILED"),
+            metadata: reason.clone(),
+        };
+        let mut events: Vec<TrackingEvent> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Events(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        events.push_back(event);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Events(product_id.clone()), &events);
+
+        env.events().publish(
+            (Symbol::new(&env, "product_spoiled"), product_id),
+            reason,
+        );
+        true
+    }
+
+    // ── #408: Key rotation ────────────────────────────────────────────────────
+
+    /// Rotate the owner key for a product.
+    ///
+    /// The current owner must sign (via `old_owner.require_auth()`).
+    /// The new owner address replaces the old one atomically.
+    /// This is semantically equivalent to `transfer_ownership` but is
+    /// explicitly named for key-rotation workflows.
+    pub fn rotate_owner_key(
+        env: Env,
+        product_id: String,
+        old_owner: Address,
+        new_owner: Address,
+    ) -> bool {
+        let mut product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+
+        if product.owner != old_owner {
+            panic!("old_owner does not match current owner");
+        }
+        if old_owner == new_owner {
+            panic!("new_owner must differ from old_owner");
+        }
+
+        old_owner.require_auth();
+
+        product.owner = new_owner.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Product(product_id.clone()), &product);
+
+        env.events().publish(
+            (Symbol::new(&env, "owner_key_rotated"), product_id),
+            (old_owner, new_owner),
+        );
+        true
+    }
+
+    /// Rotate an authorized actor key for a product.
+    ///
+    /// The old actor must sign. The old address is removed from
+    /// `authorized_actors` and the new address is appended atomically.
+    pub fn rotate_authorized_actor_key(
+        env: Env,
+        product_id: String,
+        old_actor: Address,
+        new_actor: Address,
+    ) -> bool {
+        let mut product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+
+        if old_actor == new_actor {
+            panic!("new_actor must differ from old_actor");
+        }
+
+        // Verify old_actor is currently authorized
+        if !product.authorized_actors.contains(&old_actor) {
+            panic!("old_actor is not an authorized actor");
+        }
+
+        old_actor.require_auth();
+
+        // Replace old_actor with new_actor
+        let mut new_actors = Vec::new(&env);
+        for i in 0..product.authorized_actors.len() {
+            let a = product.authorized_actors.get(i).unwrap();
+            if a == old_actor {
+                new_actors.push_back(new_actor.clone());
+            } else {
+                new_actors.push_back(a);
+            }
+        }
+        product.authorized_actors = new_actors;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Product(product_id.clone()), &product);
+
+        env.events().publish(
+            (Symbol::new(&env, "actor_key_rotated"), product_id),
+            (old_actor, new_actor),
+        );
+        true
+    }
+
+    // ── #405: Batch / lot tracking ────────────────────────────────────────────
+
+    /// Create a new batch/lot grouping.
+    pub fn create_batch(
+        env: Env,
+        id: String,
+        name: String,
+        owner: Address,
+    ) -> Batch {
+        owner.require_auth();
+        let batch = Batch {
+            id: id.clone(),
+            name,
+            owner,
+            product_ids: Vec::new(&env),
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Batch(id.clone()), &batch);
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_created"), id),
+            batch.clone(),
+        );
+        batch
+    }
+
+    /// Add a product to a batch (batch owner-only).
+    pub fn add_product_to_batch(
+        env: Env,
+        batch_id: String,
+        product_id: String,
+    ) -> bool {
+        let mut batch: Batch = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Batch(batch_id.clone()))
+            .expect("batch not found");
+
+        // Verify product exists
+        if !env.storage().persistent().has(&DataKey::Product(product_id.clone())) {
+            panic!("product not found");
+        }
+
+        batch.owner.require_auth();
+        batch.product_ids.push_back(product_id.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::Batch(batch_id.clone()), &batch);
+
+        env.events().publish(
+            (Symbol::new(&env, "product_added_to_batch"), batch_id),
+            product_id,
+        );
+        true
+    }
+
+    /// Record an aggregate event against a batch (batch owner-only).
+    /// The event is stored at the batch level and does NOT appear in
+    /// individual product event logs.
+    pub fn record_batch_event(
+        env: Env,
+        batch_id: String,
+        caller: Address,
+        location: String,
+        event_type: String,
+        metadata: String,
+    ) -> TrackingEvent {
+        let batch: Batch = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Batch(batch_id.clone()))
+            .expect("batch not found");
+
+        if batch.owner != caller {
+            panic!("caller is not the batch owner");
+        }
+        caller.require_auth();
+
+        let event = TrackingEvent {
+            product_id: batch_id.clone(),
+            location,
+            actor: caller,
+            timestamp: env.ledger().timestamp(),
+            event_type,
+            metadata,
+        };
+
+        let mut events: Vec<TrackingEvent> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BatchEvents(batch_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        events.push_back(event.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::BatchEvents(batch_id), &events);
+
+        event
+    }
+
+    /// Get all events recorded at the batch level.
+    pub fn get_batch_events(env: Env, batch_id: String) -> Vec<TrackingEvent> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BatchEvents(batch_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Get a batch by ID.
+    pub fn get_batch(env: Env, id: String) -> Batch {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Batch(id))
+            .expect("batch not found")
     }
 }
 
