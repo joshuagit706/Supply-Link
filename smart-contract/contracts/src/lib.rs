@@ -14,6 +14,7 @@ pub const EVENT_SCHEMA_VERSION: u32 = 1;
 
 mod tests;
 mod resilience_tests;
+mod compliance_tests;
 
 // ── Payload size limits (issue #311) ─────────────────────────────────────────
 // All limits are in bytes (Soroban String::len() returns byte count).
@@ -50,6 +51,34 @@ pub enum Error {
     OwnerOnly = 5,
     PendingEventExpired = 6,
     InvalidNonce = 7,
+    ComplianceViolation = 8,
+}
+
+// ── Compliance rule types ─────────────────────────────────────────────────────
+pub const COMPLIANCE_REQUIRED_ORDER: u32 = 0;
+pub const COMPLIANCE_MANDATORY_INSPECTION: u32 = 1;
+pub const COMPLIANCE_MAX_TIME_BETWEEN_STAGES: u32 = 2;
+
+/// A single compliance rule constraining event sequencing for a product.
+#[contracttype]
+#[derive(Clone)]
+pub struct ComplianceRule {
+    /// Rule kind: 0=RequiredOrder, 1=MandatoryInspection, 2=MaxTimeBetweenStages.
+    pub rule_type: u32,
+    /// Preceding stage that must have occurred (for types 0 and 1).
+    pub from_stage: String,
+    /// Stage this rule guards (the event type being submitted).
+    pub to_stage: String,
+    /// Max seconds allowed between from_stage and to_stage (for type 2).
+    pub max_seconds: u64,
+}
+
+/// Per-product compliance policy: a collection of rules enforced on every event.
+#[contracttype]
+#[derive(Clone)]
+pub struct CompliancePolicy {
+    pub product_id: String,
+    pub rules: Vec<ComplianceRule>,
 }
 
 // ── Data models ──────────────────────────────────────────────────────────────
@@ -228,6 +257,8 @@ pub enum DataKey {
     ProductIndex(u64),
     /// Key for actor nonce tracking. The inner `Address` is the actor address.
     ActorNonce(Address),
+    /// Key for the compliance policy of a product. The inner `String` is the product ID.
+    CompliancePolicy(String),
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -411,6 +442,9 @@ impl SupplyLinkContract {
         // Issue #311: enforce size limits.
         assert_len(&location, MAX_LOCATION_LEN, "location");
         assert_len(&metadata, MAX_METADATA_LEN, "metadata");
+
+        // Issue #433: enforce compliance policy before recording the event.
+        Self::check_compliance(&env, &product_id, &event_type, env.ledger().timestamp())?;
 
         let event = TrackingEvent {
             schema_version: EVENT_SCHEMA_VERSION,
@@ -1353,6 +1387,107 @@ impl SupplyLinkContract {
         }
 
         pending.get(event_index).unwrap().pending_event_id
+    }
+
+    /// Store or replace the compliance policy for a product.
+    ///
+    /// Only the product owner may call this function. Each rule in the policy
+    /// is enforced on every subsequent `add_tracking_event` call.
+    pub fn set_compliance_policy(
+        env: Env,
+        product_id: String,
+        rules: Vec<ComplianceRule>,
+    ) -> Result<CompliancePolicy, Error> {
+        let product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .ok_or(Error::ProductNotFound)?;
+
+        product.owner.require_auth();
+
+        let policy = CompliancePolicy {
+            product_id: product_id.clone(),
+            rules,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CompliancePolicy(product_id.clone()), &policy);
+
+        env.events().publish(
+            (Symbol::new(&env, "compliance_policy_set"), product_id),
+            policy.clone(),
+        );
+
+        Ok(policy)
+    }
+
+    /// Retrieve the compliance policy for a product, if one has been set.
+    pub fn get_compliance_policy(env: Env, product_id: String) -> Option<CompliancePolicy> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CompliancePolicy(product_id))
+    }
+
+    fn check_compliance(
+        env: &Env,
+        product_id: &String,
+        event_type: &String,
+        current_time: u64,
+    ) -> Result<(), Error> {
+        let policy: CompliancePolicy = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::CompliancePolicy(product_id.clone()))
+        {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        let events: Vec<TrackingEvent> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Events(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+
+        for i in 0..policy.rules.len() {
+            let rule = policy.rules.get(i).unwrap();
+
+            if rule.to_stage != *event_type {
+                continue;
+            }
+
+            if rule.rule_type == COMPLIANCE_REQUIRED_ORDER
+                || rule.rule_type == COMPLIANCE_MANDATORY_INSPECTION
+            {
+                let mut found = false;
+                for j in 0..events.len() {
+                    if events.get(j).unwrap().event_type == rule.from_stage {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    return Err(Error::ComplianceViolation);
+                }
+            } else if rule.rule_type == COMPLIANCE_MAX_TIME_BETWEEN_STAGES {
+                let mut last_from_time: Option<u64> = None;
+                for j in 0..events.len() {
+                    let ev = events.get(j).unwrap();
+                    if ev.event_type == rule.from_stage {
+                        last_from_time = Some(ev.timestamp);
+                    }
+                }
+                if let Some(last_time) = last_from_time {
+                    if current_time > last_time + rule.max_seconds {
+                        return Err(Error::ComplianceViolation);
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn validate_and_increment_nonce(env: &Env, actor: &Address, provided_nonce: u64) {

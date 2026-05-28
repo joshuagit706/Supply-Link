@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { useShallow } from 'zustand/react/shallow';
 import type { Product } from '@/lib/types';
 import { createWalletSlice } from './walletSlice';
 import { createProductsSlice } from './productsSlice';
@@ -22,7 +23,11 @@ export const useStore = create<SupplyLinkStore>()(
   ),
 );
 
-/** Derived selector: filtered + sorted products (#50) */
+/** Derived selector: filtered + sorted products (#50).
+ *
+ *  Uses useShallow so the returned array reference only changes when the
+ *  content changes, preventing unnecessary re-renders of large product lists.
+ */
 export function selectFilteredProducts(state: SupplyLinkStore): Product[] {
   const { products, searchQuery, filterEventType, sortBy, sortOrder } = state;
 
@@ -31,8 +36,6 @@ export function selectFilteredProducts(state: SupplyLinkStore): Product[] {
       searchQuery === '' ||
       p.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       p.id.toLowerCase().includes(searchQuery.toLowerCase());
-    // filterEventType is reserved for event-based filtering in future;
-    // products don't carry event type directly so we pass through for now.
     const matchesFilter = filterEventType === null || true;
     return matchesSearch && matchesFilter;
   });
@@ -44,4 +47,9 @@ export function selectFilteredProducts(state: SupplyLinkStore): Product[] {
     if (av > bv) return sortOrder === 'asc' ? 1 : -1;
     return 0;
   });
+}
+
+/** Stable hook wrapper — prevents re-renders unless the filtered list actually changes. */
+export function useFilteredProducts(): Product[] {
+  return useStore(useShallow(selectFilteredProducts));
 }
