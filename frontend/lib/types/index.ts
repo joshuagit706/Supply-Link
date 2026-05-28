@@ -29,6 +29,23 @@ export interface Product {
   origin: string;
   owner: string;
   timestamp: number;
+  active?: boolean;
+  authorizedActors: string[];
+  ownershipHistory?: OwnershipRecord[];
+  /** Unix seconds expiration timestamp. 0 = not set. (#406) */
+  expirationTimestamp?: number;
+  /** Whether the product has been marked as spoiled. (#406) */
+  spoiled?: boolean;
+  /** true while an on-chain transaction is in-flight */
+  pending?: boolean;
+}
+
+export interface Batch {
+  id: string;
+  name: string;
+  owner: string;
+  productIds: string[];
+  timestamp: number;
   active: boolean;
   status?: ProductStatus;
   authorizedActors: string[];
