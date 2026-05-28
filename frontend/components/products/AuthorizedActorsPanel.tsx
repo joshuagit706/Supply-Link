@@ -4,12 +4,11 @@ import { useState, type ChangeEvent, type FormEvent } from "react";
 import { Trash2, Plus, Loader2 } from "lucide-react";
 import { useStore } from "@/lib/state/store";
 import { addAuthorizedActor, removeAuthorizedActor } from "@/lib/stellar/client";
-
-// Stellar address: G + 55 uppercase alphanumeric chars = 56 total
-const STELLAR_ADDRESS_RE = /^G[A-Z0-9]{55}$/;
+import { stellarAddressSchema } from "@/lib/validators";
+import { InviteButton } from "./InviteButton";
 
 function isValidStellarAddress(addr: string): boolean {
-  return STELLAR_ADDRESS_RE.test(addr);
+  return stellarAddressSchema.safeParse(addr).success;
 }
 
 interface PendingOp {
@@ -143,6 +142,12 @@ export function AuthorizedActorsPanel({ productId, initialActors }: AuthorizedAc
         {inputError && <p className="text-xs text-red-500">{inputError}</p>}
         {txError && <p className="text-xs text-red-500">{txError}</p>}
       </form>
+
+      {/* Invite via link */}
+      <div className="border-t border-[var(--card-border)] pt-4">
+        <p className="text-xs text-[var(--muted)] mb-2">Or invite via one-time link:</p>
+        <InviteButton productId={productId} />
+      </div>
     </div>
   );
 }
