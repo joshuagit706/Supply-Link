@@ -1,13 +1,12 @@
-export type EventType = "HARVEST" | "PROCESSING" | "SHIPPING" | "RETAIL" | "SPOILED" | "EXPIRED";
-
-export type ActorRole = "Producer" | "Processor" | "Shipper" | "Retailer" | "Any";
-export type EventType = "HARVEST" | "PROCESSING" | "SHIPPING" | "RETAIL";
-export type ProductStatus = "active" | "inactive";
+export type EventType = 'HARVEST' | 'PROCESSING' | 'SHIPPING' | 'RETAIL';
+export type ProductStatus = 'active' | 'inactive';
 
 export interface TemplateStage {
   label: string;
   eventType: EventType;
 }
+
+export type ActorRole = "Producer" | "Processor" | "Shipper" | "Retailer" | "Any";
 
 export interface OwnershipRecord {
   owner: string;
@@ -68,16 +67,12 @@ export interface TrackingEvent {
   metadata: string;
   /** Stable deterministic event ID — SHA-256 hex (#386) */
   stableId?: string;
-  /** true while an on-chain transaction is in-flight */
+  /** true while an on-chain transaction is in-flight (#49) */
   pending?: boolean;
 }
 
 export interface EventPage {
   events: TrackingEvent[];
-  /** true while an on-chain transaction is in-flight (#49) */
-  pending?: boolean;
-}
-
 export interface PendingEvent {
   productId: string;
   event: TrackingEvent;
@@ -99,7 +94,7 @@ export interface Notification {
 
 export interface TransactionResult {
   hash: string;
-  status: "success" | "failed" | "pending";
+  status: 'success' | 'failed' | 'pending';
   fee: string;
   timestamp: number;
 }

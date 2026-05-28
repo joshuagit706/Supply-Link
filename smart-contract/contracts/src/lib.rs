@@ -1,5 +1,8 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, Address, Bytes, Env, String, Vec, Symbol,
+};
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, Env, String, Vec, Symbol};
 
 /// Current event schema version.
@@ -11,7 +14,8 @@ use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, 
 /// | Version | Changes |
 /// |---------|---------|
 /// | 1       | Initial versioned schema. Adds `schema_version` field. |
-pub const EVENT_SCHEMA_VERSION: u32 = 1;
+/// | 2       | Adds `metadata_commitment` and `private_metadata` fields for privacy-preserving (off-chain encrypted) metadata. |
+pub const EVENT_SCHEMA_VERSION: u32 = 2;
 
 mod tests;
 mod resilience_tests;
@@ -30,6 +34,9 @@ const MAX_NAME_LEN:     u32 = 256;
 const MAX_ORIGIN_LEN:   u32 = 256;
 const MAX_LOCATION_LEN: u32 = 256;
 const MAX_METADATA_LEN: u32 = 4096;
+// Privacy commitment (issue #409): a hex-encoded hash of the off-chain encrypted
+// payload. A SHA-256 hex digest is 64 chars; allow headroom for other digests.
+const MAX_COMMITMENT_LEN: u32 = 128;
 
 // ── Event expiration policy (issue #314) ──────────────────────────────────────
 /// Pending events expire after this many seconds (7 days).
@@ -91,11 +98,7 @@ pub struct Product {
     /// to the owner. Managed via [`SupplyLinkContract::add_authorized_actor`]
     /// and [`SupplyLinkContract::remove_authorized_actor`].
     pub authorized_actors: Vec<Address>,
-    /// Unix timestamp (seconds) after which the product is considered expired.
-    /// 0 means no expiration set.
-    pub expiration_timestamp: u64,
-    /// Whether the product has been marked as spoiled.
-    pub spoiled: bool,
+    /// Whether the product is active. Deactivated products reject new events.
     /// Number of signatures required to approve events for this product.
     /// If 0 or 1, events are recorded immediately. If > 1, events are staged
     /// as pending until the required number of approvals are received.
@@ -149,7 +152,53 @@ pub struct TrackingEvent {
     /// Arbitrary JSON string carrying stage-specific metadata
     /// (e.g. `{"temperature":"4°C","humidity":"60%"}`). The contract stores
     /// this opaquely; consumers are responsible for parsing it.
+    ///
+    /// For privacy-preserving events (see `private_metadata`) this field is an
+    /// **empty string**: the plaintext is never written on-chain. The encrypted
+    /// payload lives off-chain and only its hash is recorded in
+    /// `metadata_commitment`.
     pub metadata: String,
+    /// Stable deterministic event ID — a hex-encoded SHA-256 hash of the
+    /// canonical fields: `product_id|actor|event_type|timestamp|metadata`.
+    /// Invariant across contract upgrades; suitable for deep links and QR payloads.
+    pub stable_id: String,
+}
+
+// ── Role types (#387) ─────────────────────────────────────────────────────────
+
+/// Named role for an authorized actor.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub enum Role {
+    /// Can harvest/originate events.
+    Producer,
+    /// Can add processing events.
+    Processor,
+    /// Can add shipping events.
+    Shipper,
+    /// Can add retail events.
+    Retailer,
+    /// Can add any event type.
+    Any,
+}
+
+/// Binds an actor address to a named role.
+#[contracttype]
+#[derive(Clone)]
+pub struct ActorRole {
+    pub actor: Address,
+    pub role: Role,
+}
+
+/// Authorization policy for a product.
+#[contracttype]
+#[derive(Clone)]
+pub struct AuthPolicy {
+    /// Minimum number of distinct authorized actors that must sign an event
+    /// for high-risk event types. 1 = single-signer (default).
+    pub threshold: u32,
+    /// Role assignments for this product's authorized actors.
+    pub roles: Vec<ActorRole>,
 }
 
 /// A pending event awaiting multi-signature approval.
@@ -249,6 +298,8 @@ pub enum DataKey {
     /// Key for the index-to-ID mapping used by pagination.
     /// The inner `u64` is the zero-based insertion index.
     ProductIndex(u64),
+    /// Key for the authorization policy (roles + threshold) of a product.
+    AuthPolicy(String),
     /// Key for actor nonce tracking. The inner `Address` is the actor address.
     ActorNonce(Address),
 }
@@ -429,14 +480,11 @@ impl SupplyLinkContract {
             .get(&DataKey::Product(product_id.clone()))
             .ok_or(Error::ProductNotFound)?;
 
-        if product.spoiled {
-            panic!("product is spoiled");
+        if !product.active {
+            panic!("product is deactivated");
         }
 
-        let is_owner = product.owner == caller;
-        let is_actor = product.authorized_actors.contains(&caller);
-        if !is_owner && !is_actor {
-            panic!("caller is not authorized");
+        // Verify caller is owner or an authorized actor before requiring auth
         let is_owner = product.owner == caller;
         let is_actor = product.authorized_actors.contains(&caller);
         if !is_owner && !is_actor {
@@ -447,34 +495,124 @@ impl SupplyLinkContract {
         assert_len(&location, MAX_LOCATION_LEN, "location");
         assert_len(&metadata, MAX_METADATA_LEN, "metadata");
 
+        let timestamp = env.ledger().timestamp();
+
+        // Compute stable_id: SHA-256 of "product_id|event_type|timestamp" encoded as bytes
+        let stable_id = compute_stable_id(&env, &product_id, &caller, &event_type, timestamp, &metadata);
+
+        let event = TrackingEvent {
+            schema_version: EVENT_SCHEMA_VERSION,
+            product_id: product_id.clone(),
+            location,
+o            actor: caller,
+            timestamp,
+            actor: caller.clone(),
+            timestamp: env.ledger().timestamp(),
+            event_type: event_type.clone(),
+            metadata,
+            stable_id,
+        };
+
+        Self::record_event(&env, &product, event.clone());
+
+        Ok(event)
+    }
+
+    /// Add a tracking event whose metadata is private (issue #409).
+    ///
+    /// Identical to [`Self::add_tracking_event`] except the plaintext metadata is
+    /// **never** written on-chain. The caller encrypts the sensitive metadata
+    /// off-chain, stores the ciphertext off-chain, and submits only a
+    /// `metadata_commitment` — a hex-encoded hash of that ciphertext. The stored
+    /// event has `private_metadata = true` and an empty `metadata` field.
+    ///
+    /// This preserves provable provenance (anyone can hash the off-chain payload
+    /// and compare it against the on-chain commitment) while keeping the contents
+    /// confidential: the commitment is a one-way hash, so the plaintext cannot be
+    /// recovered from on-chain data alone.
+    ///
+    /// # Parameters
+    /// - `metadata_commitment` — Hex-encoded hash of the off-chain encrypted
+    ///   payload. Must be non-empty and at most `MAX_COMMITMENT_LEN` bytes.
+    ///
+    /// # Authorization
+    /// Identical to [`Self::add_tracking_event`].
+    ///
+    /// # Panics
+    /// - `"commitment required for private metadata"` — if `metadata_commitment` is empty.
+    /// - `"metadata_commitment exceeds max length"` — if the commitment is too long.
+    ///
+    /// # Errors
+    /// - [`Error::ProductNotFound`] — if `product_id` is not registered.
+    /// - [`Error::NotAuthorized`] — if `caller` is neither owner nor authorized actor.
+    pub fn add_private_tracking_event(
+        env: Env,
+        product_id: String,
+        caller: Address,
+        location: String,
+        event_type: String,
+        metadata_commitment: String,
+    ) -> Result<TrackingEvent, Error> {
+        let product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .ok_or(Error::ProductNotFound)?;
+
+        let is_owner = product.owner == caller;
+        let is_actor = product.authorized_actors.contains(&caller);
+        if !is_owner && !is_actor {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+
+        assert_len(&location, MAX_LOCATION_LEN, "location");
+        if metadata_commitment.len() == 0 {
+            panic!("commitment required for private metadata");
+        }
+        assert_len(&metadata_commitment, MAX_COMMITMENT_LEN, "metadata_commitment");
+
         let event = TrackingEvent {
             schema_version: EVENT_SCHEMA_VERSION,
             product_id: product_id.clone(),
             location,
             actor: caller.clone(),
             timestamp: env.ledger().timestamp(),
-            event_type: event_type.clone(),
-            metadata,
+            event_type,
+            // Plaintext is NEVER stored on-chain for private events.
+            metadata: String::from_str(&env, ""),
+            metadata_commitment,
+            private_metadata: true,
         };
 
-        // Check if multi-signature is required
+        Self::record_event(&env, &product, event.clone());
+
+        Ok(event)
+    }
+
+    /// Append a finalized event, or stage it for multi-signature approval, then
+    /// emit the matching event. Shared by [`Self::add_tracking_event`] and
+    /// [`Self::add_private_tracking_event`].
+    fn record_event(env: &Env, product: &Product, event: TrackingEvent) {
+        let product_id = event.product_id.clone();
+        let event_type = event.event_type.clone();
+
         if product.required_signatures > 1 {
             // Stage event as pending with a stable ID
             let mut pending: Vec<PendingEvent> = env
                 .storage()
                 .persistent()
                 .get(&DataKey::PendingEvents(product_id.clone()))
-                .unwrap_or_else(|| Vec::new(&env));
+                .unwrap_or_else(|| Vec::new(env));
 
-            // Generate next stable pending event ID
             let next_id: u64 = env
                 .storage()
                 .persistent()
                 .get(&DataKey::NextPendingId(product_id.clone()))
                 .unwrap_or(0u64);
 
-            let mut approvals = Vec::new(&env);
-            approvals.push_back(caller);
+            let mut approvals = Vec::new(env);
+            approvals.push_back(event.actor.clone());
 
             let pending_event = PendingEvent {
                 pending_event_id: next_id,
@@ -491,37 +629,31 @@ impl SupplyLinkContract {
                 .persistent()
                 .set(&DataKey::PendingEvents(product_id.clone()), &pending);
 
-            // Increment the ID counter for next pending event
             env.storage()
                 .persistent()
                 .set(&DataKey::NextPendingId(product_id.clone()), &(next_id + 1));
 
-            // Emit pending event
             env.events().publish(
-                (Symbol::new(&env, "event_pending"), product_id, event_type, EVENT_SCHEMA_VERSION),
-                event.clone(),
+                (Symbol::new(env, "event_pending"), product_id, event_type, EVENT_SCHEMA_VERSION),
+                event,
             );
         } else {
-            // Immediately finalize event
             let mut events: Vec<TrackingEvent> = env
                 .storage()
                 .persistent()
                 .get(&DataKey::Events(product_id.clone()))
-                .unwrap_or_else(|| Vec::new(&env));
+                .unwrap_or_else(|| Vec::new(env));
 
             events.push_back(event.clone());
             env.storage()
                 .persistent()
                 .set(&DataKey::Events(product_id.clone()), &events);
 
-            // Emit event
             env.events().publish(
-                (Symbol::new(&env, "event_added"), product_id, event_type, EVENT_SCHEMA_VERSION),
-                event.clone(),
+                (Symbol::new(env, "event_added"), product_id, event_type, EVENT_SCHEMA_VERSION),
+                event,
             );
         }
-
-        Ok(event)
     }
 
     /// Retrieve a product by its ID.
@@ -1028,6 +1160,65 @@ impl SupplyLinkContract {
         products
     }
 
+    // ── #388: Paginated event retrieval ───────────────────────────────────────
+
+    /// Return a paginated slice of tracking events for a product.
+    ///
+    /// Events are returned in insertion order (oldest first).
+    ///
+    /// # Parameters
+    /// - `product_id` — The product to query.
+    /// - `offset` — Zero-based index of the first event to return.
+    /// - `limit` — Maximum number of events to return.
+    ///
+    /// # Returns
+    /// A `Vec<TrackingEvent>`. Returns an empty vector if offset is beyond
+    /// the total count or the product has no events.
+    pub fn list_tracking_events(
+        env: Env,
+        product_id: String,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<TrackingEvent> {
+        let all: Vec<TrackingEvent> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Events(product_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = all.len();
+        if offset >= total {
+            return Vec::new(&env);
+        }
+
+        let end = core::cmp::min(offset + limit, total);
+        let mut page = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(all.get(i).unwrap());
+        }
+        page
+    }
+
+    /// Return the total number of tracking events for a product.
+    /// Alias of `get_events_count` — provided for API symmetry with `list_tracking_events`.
+    pub fn count_tracking_events(env: Env, product_id: String) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Vec<TrackingEvent>>(&DataKey::Events(product_id))
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+
+    // ── #387: Role segregation ────────────────────────────────────────────────
+
+    /// Assign a named role to an authorized actor for a product.
+    ///
+    /// The actor must already be in `authorized_actors`. Replaces any existing
+    /// role assignment for the same actor.
+    ///
+    /// # Authorization
+    /// Requires `product.owner.require_auth()`.
+    pub fn assign_role(env: Env, product_id: String, actor: Address, role: Role) -> bool {
     /// Approve a pending event for a high-value product.
     ///
     /// For products with `required_signatures > 1`, events are staged as pending
@@ -1204,6 +1395,196 @@ impl SupplyLinkContract {
             .storage()
             .persistent()
             .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+        product.owner.require_auth();
+
+        let mut policy: AuthPolicy = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuthPolicy(product_id.clone()))
+            .unwrap_or(AuthPolicy {
+                threshold: 1,
+                roles: Vec::new(&env),
+            });
+
+        // Replace existing role for actor or append
+        let mut new_roles: Vec<ActorRole> = Vec::new(&env);
+        let mut replaced = false;
+        for i in 0..policy.roles.len() {
+            let ar = policy.roles.get(i).unwrap();
+            if ar.actor == actor {
+                new_roles.push_back(ActorRole { actor: actor.clone(), role: role.clone() });
+                replaced = true;
+            } else {
+                new_roles.push_back(ar);
+            }
+        }
+        if !replaced {
+            new_roles.push_back(ActorRole { actor, role });
+        }
+        policy.roles = new_roles;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuthPolicy(product_id), &policy);
+        true
+    }
+
+    /// Revoke the role assignment for an actor on a product.
+    ///
+    /// # Authorization
+    /// Requires `product.owner.require_auth()`.
+    pub fn revoke_role(env: Env, product_id: String, actor: Address) -> bool {
+        let product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+        product.owner.require_auth();
+
+        let mut policy: AuthPolicy = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuthPolicy(product_id.clone()))
+            .unwrap_or(AuthPolicy {
+                threshold: 1,
+                roles: Vec::new(&env),
+            });
+
+        let mut new_roles: Vec<ActorRole> = Vec::new(&env);
+        let mut found = false;
+        for i in 0..policy.roles.len() {
+            let ar = policy.roles.get(i).unwrap();
+            if ar.actor == actor {
+                found = true;
+            } else {
+                new_roles.push_back(ar);
+            }
+        }
+        policy.roles = new_roles;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuthPolicy(product_id), &policy);
+        found
+    }
+
+    /// Set the minimum number of signers required for an event on this product.
+    ///
+    /// # Authorization
+    /// Requires `product.owner.require_auth()`.
+    pub fn set_event_threshold(env: Env, product_id: String, threshold: u32) -> bool {
+        let product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+        product.owner.require_auth();
+
+        let mut policy: AuthPolicy = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuthPolicy(product_id.clone()))
+            .unwrap_or(AuthPolicy {
+                threshold: 1,
+                roles: Vec::new(&env),
+            });
+        policy.threshold = threshold;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuthPolicy(product_id), &policy);
+        true
+    }
+
+    /// Return the authorization policy (roles + threshold) for a product.
+    pub fn get_authorization_policy(env: Env, product_id: String) -> AuthPolicy {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AuthPolicy(product_id))
+            .unwrap_or(AuthPolicy {
+                threshold: 1,
+                roles: Vec::new(&env),
+            })
+    }
+
+    // ── Deactivate / reactivate (#3) ──────────────────────────────────────────
+
+    /// Deactivate a product (owner-only). Idempotent.
+    pub fn deactivate_product(env: Env, product_id: String) -> bool {
+        let mut product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+        product.owner.require_auth();
+        product.active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Product(product_id), &product);
+        true
+    }
+
+    /// Reactivate a previously deactivated product (owner-only). Idempotent.
+    pub fn reactivate_product(env: Env, product_id: String) -> bool {
+        let mut product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+        product.owner.require_auth();
+        product.active = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Product(product_id), &product);
+        true
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Compute a stable deterministic event ID.
+///
+/// Concatenates `product_id`, `actor` (as bytes), `event_type`, `timestamp`
+/// (big-endian u64), and `metadata` into a single byte buffer, then returns
+/// the SHA-256 hash as a lowercase hex `String`.
+///
+/// The result is invariant as long as the input fields are identical, making
+/// it safe to use as a permanent reference across contract upgrades.
+fn compute_stable_id(
+    env: &Env,
+    product_id: &String,
+    actor: &Address,
+    event_type: &String,
+    timestamp: u64,
+    metadata: &String,
+) -> String {
+    // Build a byte buffer: product_id bytes + event_type bytes + timestamp (8 bytes BE) + metadata bytes
+    let pid_bytes = product_id.clone().to_xdr(env);
+    let et_bytes = event_type.clone().to_xdr(env);
+    let meta_bytes = metadata.clone().to_xdr(env);
+    let actor_bytes = actor.clone().to_xdr(env);
+
+    let ts_bytes: [u8; 8] = timestamp.to_be_bytes();
+    let ts_buf = Bytes::from_array(env, &ts_bytes);
+
+    let mut buf = Bytes::new(env);
+    buf.append(&pid_bytes);
+    buf.append(&actor_bytes);
+    buf.append(&et_bytes);
+    buf.append(&ts_buf);
+    buf.append(&meta_bytes);
+
+    let hash = env.crypto().sha256(&buf);
+
+    // Encode hash as lowercase hex string
+    let hex_chars = b"0123456789abcdef";
+    let mut hex_bytes = [0u8; 64];
+    for (i, byte) in hash.to_array().iter().enumerate() {
+        hex_bytes[i * 2] = hex_chars[(byte >> 4) as usize];
+        hex_bytes[i * 2 + 1] = hex_chars[(byte & 0xf) as usize];
+    }
+    String::from_bytes(env, &hex_bytes)
             .ok_or(Error::ProductNotFound)?;
 
         if product.owner != rejector {
