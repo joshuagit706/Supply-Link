@@ -1,7 +1,8 @@
-"use client";
+'use client';
 
-import { useState } from "react";
-import type { PendingEvent } from "@/lib/types";
+import { useState } from 'react';
+import type { PendingEvent } from '@/lib/types';
+import { recordApprovalEvent } from '@/lib/api/approvalLog';
 
 interface Props {
   productId: string;
@@ -22,20 +23,28 @@ export function PendingEventApprovalPanel({
   const [error, setError] = useState<string | null>(null);
 
   if (pendingEvents.length === 0) {
-    return (
-      <p className="text-sm text-[var(--muted)]">No pending events awaiting approval.</p>
-    );
+    return <p className="text-sm text-[var(--muted)]">No pending events awaiting approval.</p>;
   }
 
   const handleApprove = async (index: number) => {
     setLoadingIndex(index);
     setError(null);
+    const pending = pendingEvents[index];
+    const submittedAt = pending.createdAt * 1000;
     try {
       if (onApprove) {
         await onApprove(index);
       }
+      recordApprovalEvent({
+        action: 'approve_event',
+        productId,
+        actor: 'owner',
+        success: true,
+        latencyMs: Date.now() - submittedAt,
+      });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to approve event");
+      recordApprovalEvent({ action: 'approve_event', productId, actor: 'owner', success: false });
+      setError(err instanceof Error ? err.message : 'Failed to approve event');
     } finally {
       setLoadingIndex(null);
     }
@@ -44,12 +53,22 @@ export function PendingEventApprovalPanel({
   const handleReject = async (index: number) => {
     setLoadingIndex(index);
     setError(null);
+    const pending = pendingEvents[index];
+    const submittedAt = pending.createdAt * 1000;
     try {
       if (onReject) {
         await onReject(index);
       }
+      recordApprovalEvent({
+        action: 'reject_event',
+        productId,
+        actor: 'owner',
+        success: true,
+        latencyMs: Date.now() - submittedAt,
+      });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to reject event");
+      recordApprovalEvent({ action: 'reject_event', productId, actor: 'owner', success: false });
+      setError(err instanceof Error ? err.message : 'Failed to reject event');
     } finally {
       setLoadingIndex(null);
     }
@@ -70,12 +89,8 @@ export function PendingEventApprovalPanel({
         >
           <div className="flex items-start justify-between gap-4 mb-3">
             <div className="flex-1">
-              <p className="font-semibold text-[var(--foreground)]">
-                {pending.event.eventType}
-              </p>
-              <p className="text-sm text-[var(--muted)] mt-1">
-                Location: {pending.event.location}
-              </p>
+              <p className="font-semibold text-[var(--foreground)]">{pending.event.eventType}</p>
+              <p className="text-sm text-[var(--muted)] mt-1">Location: {pending.event.location}</p>
               <p className="text-xs text-[var(--muted)] mt-1">
                 Submitted: {new Date(pending.createdAt * 1000).toLocaleString()}
               </p>
@@ -102,9 +117,7 @@ export function PendingEventApprovalPanel({
 
           {/* Approvers list */}
           <div className="mb-3">
-            <p className="text-xs font-semibold text-[var(--muted)] uppercase mb-2">
-              Approvals
-            </p>
+            <p className="text-xs font-semibold text-[var(--muted)] uppercase mb-2">Approvals</p>
             <div className="space-y-1">
               {pending.approvals.map((approver, i) => (
                 <p key={i} className="text-xs font-mono text-[var(--foreground)] break-all">
@@ -122,14 +135,14 @@ export function PendingEventApprovalPanel({
                 disabled={loadingIndex === index}
                 className="flex-1 px-3 py-2 rounded-lg bg-green-600 hover:bg-green-700 text-white text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
-                {loadingIndex === index ? "Approving..." : "Approve"}
+                {loadingIndex === index ? 'Approving...' : 'Approve'}
               </button>
               <button
                 onClick={() => handleReject(index)}
                 disabled={loadingIndex === index}
                 className="flex-1 px-3 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
-                {loadingIndex === index ? "Rejecting..." : "Reject"}
+                {loadingIndex === index ? 'Rejecting...' : 'Reject'}
               </button>
             </div>
           )}
