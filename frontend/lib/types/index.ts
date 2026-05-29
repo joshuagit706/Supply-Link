@@ -57,6 +57,14 @@ export interface Batch {
   requiredSignatures?: number;
   /** true while an on-chain transaction is in-flight (#49) */
   pending?: boolean;
+  /** Whether this product has been recalled (#393) */
+  recalled?: boolean;
+  /** Reason provided when the product was recalled (#393) */
+  recallReason?: string;
+  /** Ledger timestamp when the product was recalled; 0 if never recalled (#393) */
+  recallTimestamp?: number;
+  /** Schema version of this record (#392) */
+  schemaVersion?: number;
   /** Off-chain image URL stored in product metadata (#112) */
   imageUrl?: string;
   /** Taxonomy category ID (#425) */
@@ -107,6 +115,8 @@ export interface EventPage {
   stableId?: string;
   /** true while an on-chain transaction is in-flight (#49) */
   pending?: boolean;
+  /** Schema version of this record (#392) */
+  schemaVersion?: number;
 }
 
 export interface EventPage {
