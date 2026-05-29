@@ -2115,69 +2115,10 @@ fn compute_stable_id(
         hex_bytes[i * 2] = hex_chars[(byte >> 4) as usize];
         hex_bytes[i * 2 + 1] = hex_chars[(byte & 0xf) as usize];
     }
+
+    // Return the hex string representing the SHA-256 digest.
     String::from_bytes(env, &hex_bytes)
-            .ok_or(Error::ProductNotFound)?;
-
-        if product.owner != rejector {
-            return Err(Error::OwnerOnly);
-        }
-        rejector.require_auth();
-        Self::validate_and_increment_nonce(&env, &rejector, nonce);
-
-        // Validate reason length (max 256 characters)
-        if reason.len() > 256 {
-            panic!("rejection reason too long");
-        }
-
-        let mut pending: Vec<PendingEvent> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PendingEvents(product_id.clone()))
-            .ok_or(Error::NoPendingEvents)?;
-
-        // Find the pending event by stable ID (not index-based)
-        let mut event_position: Option<usize> = None;
-        for i in 0..pending.len() {
-            if pending.get(i).unwrap().pending_event_id == pending_event_id {
-                event_position = Some(i);
-                break;
-            }
-        }
-
-        let event_index = event_position.ok_or_else(|| {
-            panic!("pending event not found")
-        })?;
-
-        let rejected_event = pending.get(event_index).unwrap().clone();
-
-        // Remove from pending
-        pending.remove(event_index);
-        if pending.len() > 0 {
-            env.storage()
-                .persistent()
-                .set(&DataKey::PendingEvents(product_id.clone()), &pending);
-        } else {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::PendingEvents(product_id.clone()));
-        }
-
-        // Emit enriched rejection event with reason
-        let rejection = EventRejection {
-            product_id: product_id.clone(),
-            event: rejected_event.event,
-            rejector,
-            reason,
-            timestamp: env.ledger().timestamp(),
-        };
-
-        env.events().publish(
-            (Symbol::new(&env, "event_rejected"), product_id),
-            rejection,
-        );
-
-        Ok(true)
-    }
+}
 
     /// Property 4: Count equals vec length
     proptest! {

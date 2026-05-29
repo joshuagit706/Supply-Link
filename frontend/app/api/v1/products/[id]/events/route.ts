@@ -121,6 +121,97 @@ async function addEvent(
   return withCors(req, withCorrelationId(req, NextResponse.json(newEvent, { status: 201 })));
 }
 
+async function addEventsBatch(
+  req: NextRequest,
+  productId: string,
+  apiKey: string,
+  rawBody: string,
+): Promise<NextResponse> {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(rawBody);
+  } catch {
+    return apiError(req, 400, ErrorCode.INVALID_PAYLOAD, 'Invalid JSON');
+  }
+
+  if (!Array.isArray(payload)) {
+    return apiError(req, 400, ErrorCode.INVALID_PAYLOAD, 'Expected an array of events');
+  }
+
+  const results: Array<Record<string, unknown>> = [];
+  const product = getProductById(productId);
+  if (!product) {
+    return apiError(req, 404, ErrorCode.VALIDATION_ERROR, `Product not found: ${productId}`);
+  }
+
+  const eventTypes: EventType[] = ['HARVEST', 'PROCESSING', 'SHIPPING', 'RETAIL'];
+
+  for (let i = 0; i < payload.length; i++) {
+    const item = payload[i] as Record<string, unknown>;
+    const resEntry: Record<string, unknown> = { index: i };
+
+    // Field validation
+    if (!eventTypes.includes(item.eventType as EventType)) {
+      resEntry.success = false;
+      resEntry.error = `Invalid eventType at index ${i}`;
+      results.push(resEntry);
+      continue;
+    }
+
+    if (typeof item.location !== 'string' || !item.location.trim()) {
+      resEntry.success = false;
+      resEntry.error = `Missing or invalid location at index ${i}`;
+      results.push(resEntry);
+      continue;
+    }
+
+    if (typeof item.actor !== 'string' || !item.actor.trim()) {
+      resEntry.success = false;
+      resEntry.error = `Missing or invalid actor at index ${i}`;
+      results.push(resEntry);
+      continue;
+    }
+
+    // Authorization: actor must be product owner or authorized actor
+    const actorStr = item.actor as string;
+    const isOwner = product.owner === actorStr;
+    const isActor = product.authorizedActors?.includes(actorStr) ?? false;
+    if (!isOwner && !isActor) {
+      resEntry.success = false;
+      resEntry.error = `Actor not authorized at index ${i}`;
+      results.push(resEntry);
+      continue;
+    }
+
+    // Metadata validation
+    const metadata = typeof item.metadata === 'string' ? item.metadata : '{}';
+    const metadataValidation = validateEventMetadata(item.eventType as string, metadata);
+    if (!metadataValidation.valid) {
+      resEntry.success = false;
+      resEntry.error = `Invalid metadata at index ${i}: ${metadataValidation.error}`;
+      results.push(resEntry);
+      continue;
+    }
+
+    // Create and persist (mock)
+    const newEvent: TrackingEvent = {
+      productId,
+      eventType: item.eventType as EventType,
+      location: item.location as string,
+      actor: actorStr,
+      timestamp: Date.now(),
+      metadata,
+    };
+    MOCK_EVENTS.push(newEvent);
+
+    resEntry.success = true;
+    resEntry.event = newEvent;
+    results.push(resEntry);
+  }
+
+  return withCors(req, withCorrelationId(req, NextResponse.json({ results }, { status: 200 })));
+}
+
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
@@ -189,10 +280,24 @@ export async function POST(
     return apiError(request, 400, ErrorCode.VALIDATION_ERROR, 'Invalid product ID');
   }
 
-  // Handle with idempotency
-  const response = await withIdempotency(request, (req, rawBody) =>
-    addEvent(req, id, auth.apiKey!, rawBody),
-  );
+  const rawBody = await request.text();
+
+  // If the client sent an array payload, handle as a batch (no idempotency wrapper)
+  let maybeArray: unknown;
+  try {
+    maybeArray = JSON.parse(rawBody);
+  } catch {
+    // fall through and let addEvent handle invalid JSON via idempotency path
+    maybeArray = null;
+  }
+
+  let response: NextResponse;
+  if (Array.isArray(maybeArray)) {
+    response = await addEventsBatch(request, id, auth.apiKey!, rawBody);
+  } else {
+    // Handle single event with idempotency
+    response = await withIdempotency(request, (req, body) => addEvent(req, id, auth.apiKey!, body));
+  }
 
   recordRequest('POST /api/v1/products/[id]/events', response.status, Date.now() - start);
   return response;
