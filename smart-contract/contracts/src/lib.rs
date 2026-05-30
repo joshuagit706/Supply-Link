@@ -37,6 +37,8 @@ pub const EVENT_SCHEMA_VERSION: u32 = 2;
 mod tests;
 mod resilience_tests;
 mod compliance_tests;
+pub mod assembly_warranty;
+mod assembly_warranty_tests;
 
 // ── Payload size limits (issue #311) ─────────────────────────────────────────
 // All limits are in bytes (Soroban String::len() returns byte count).
@@ -352,6 +354,17 @@ pub enum DataKey {
     ActorNonce(Address),
     /// Key for the compliance policy of a product. The inner `String` is the product ID.
     CompliancePolicy(String),
+    /// Key for the product assembly record (parent-child relationships).
+    /// The inner `String` is the parent product ID.
+    Assembly(String),
+    /// Key for the warranty metadata of a product.
+    /// The inner `String` is the product ID.
+    Warranty(String),
+    /// Key for the list of warranty claims for a product.
+    /// The inner `String` is the product ID.
+    WarrantyClaims(String),
+    /// Key for the certifications list of a product. (#428)
+    Certifications(String),
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -3604,6 +3617,210 @@ mod rejection_reason_tests {
             .persistent()
             .get(&DataKey::Batch(id))
             .expect("batch not found")
+    }
+
+    // ── Assembly relationships ─────────────────────────────────────────────────
+
+    /// Register or replace the assembly relationship for a parent product.
+    ///
+    /// A parent product is assembled from one or more component products.
+    /// Each component carries its own provenance chain; the assembly record
+    /// aggregates them under a single parent.
+    ///
+    /// # Parameters
+    /// - `parent_id` — ID of the assembled (parent) product.
+    /// - `component_ids` — Ordered list of component product IDs (max 50).
+    /// - `description` — Optional description of the assembly process (max 4096 bytes).
+    /// - `caller` — Must be the parent product owner.
+    ///
+    /// # Authorization
+    /// Requires `caller.require_auth()`. Caller must be the parent product owner.
+    ///
+    /// # Errors
+    /// - [`Error::ProductNotFound`] — if `parent_id` is not registered.
+    /// - [`Error::NotAuthorized`] — if caller is not the parent product owner.
+    ///
+    /// # Panics
+    /// - `"assembly exceeds maximum component count"` — if more than 50 components.
+    /// - `"component product not found"` — if any component ID is not registered.
+    /// - `"description exceeds max length"` — if description > 4096 bytes.
+    ///
+    /// # Emitted Events
+    /// Publishes `("assembly_registered", parent_id)` with the
+    /// [`assembly_warranty::ProductAssembly`] struct as the body.
+    pub fn register_assembly(
+        env: Env,
+        parent_id: String,
+        component_ids: Vec<String>,
+        description: String,
+        caller: Address,
+    ) -> Result<assembly_warranty::ProductAssembly, Error> {
+        assembly_warranty::register_assembly(&env, parent_id, component_ids, description, caller)
+    }
+
+    /// Retrieve the assembly record for a parent product.
+    ///
+    /// Returns `None` if no assembly has been registered for this product.
+    pub fn get_assembly(
+        env: Env,
+        parent_id: String,
+    ) -> Option<assembly_warranty::ProductAssembly> {
+        assembly_warranty::get_assembly(&env, parent_id)
+    }
+
+    /// Return all parent product IDs that reference `component_id` as a component.
+    ///
+    /// Performs a lookup over the provided `candidate_parent_ids` list.
+    /// Callers should supply the set of known parent IDs to search.
+    pub fn get_parents_of_component(
+        env: Env,
+        component_id: String,
+        candidate_parent_ids: Vec<String>,
+    ) -> Vec<String> {
+        assembly_warranty::get_parents_of_component(&env, component_id, candidate_parent_ids)
+    }
+
+    // ── Warranty management ───────────────────────────────────────────────────
+
+    /// Register warranty metadata for a product.
+    ///
+    /// # Parameters
+    /// - `product_id` — ID of the product to attach warranty to.
+    /// - `duration_seconds` — Warranty duration in seconds from product registration.
+    ///   Pass `0` for a lifetime warranty.
+    /// - `terms` — Short human-readable warranty terms (max 1024 bytes).
+    /// - `terms_ref` — Off-chain reference to the full warranty document (max 512 bytes).
+    /// - `caller` — Must be the product owner.
+    ///
+    /// # Authorization
+    /// Requires `caller.require_auth()`. Caller must be the product owner.
+    ///
+    /// # Errors
+    /// - [`Error::ProductNotFound`] — if `product_id` is not registered.
+    /// - [`Error::NotAuthorized`] — if caller is not the product owner.
+    ///
+    /// # Emitted Events
+    /// Publishes `("warranty_registered", product_id)` with the
+    /// [`assembly_warranty::WarrantyInfo`] struct as the body.
+    pub fn register_warranty(
+        env: Env,
+        product_id: String,
+        duration_seconds: u64,
+        terms: String,
+        terms_ref: String,
+        caller: Address,
+    ) -> Result<assembly_warranty::WarrantyInfo, Error> {
+        assembly_warranty::register_warranty(&env, product_id, duration_seconds, terms, terms_ref, caller)
+    }
+
+    /// Retrieve warranty metadata for a product.
+    ///
+    /// Returns `None` if no warranty has been registered.
+    pub fn get_warranty(
+        env: Env,
+        product_id: String,
+    ) -> Option<assembly_warranty::WarrantyInfo> {
+        assembly_warranty::get_warranty(&env, product_id)
+    }
+
+    /// Void a warranty. Owner-only.
+    ///
+    /// Once voided, new claims cannot be filed against this warranty.
+    ///
+    /// # Errors
+    /// - [`Error::ProductNotFound`] — if `product_id` is not registered.
+    /// - [`Error::NotAuthorized`] — if caller is not the product owner.
+    ///
+    /// # Panics
+    /// - `"no warranty registered"` — if no warranty exists for this product.
+    ///
+    /// # Emitted Events
+    /// Publishes `("warranty_voided", product_id)` with the updated
+    /// [`assembly_warranty::WarrantyInfo`] struct as the body.
+    pub fn void_warranty(
+        env: Env,
+        product_id: String,
+        caller: Address,
+    ) -> Result<assembly_warranty::WarrantyInfo, Error> {
+        assembly_warranty::void_warranty(&env, product_id, caller)
+    }
+
+    /// Check whether a product's warranty is currently active.
+    ///
+    /// Returns `true` if a non-voided warranty exists and the current ledger
+    /// time is within the warranty period (or the warranty has no expiry).
+    pub fn is_warranty_active(env: Env, product_id: String) -> bool {
+        assembly_warranty::is_warranty_active(&env, product_id)
+    }
+
+    /// File a warranty claim against a product.
+    ///
+    /// Any address may file a claim. The claim is linked to the product's
+    /// provenance via the `proof_ref` field (e.g. an IPFS CID pointing to
+    /// supporting documentation).
+    ///
+    /// # Parameters
+    /// - `product_id` — ID of the product the claim is filed against.
+    /// - `claim_id` — Caller-supplied unique identifier for this claim (max 128 bytes).
+    /// - `description` — Description of the issue (max 4096 bytes).
+    /// - `proof_ref` — Off-chain proof reference (max 512 bytes).
+    /// - `claimant` — Address of the claimant (self-authorizes).
+    ///
+    /// # Errors
+    /// - [`Error::ProductNotFound`] — if `product_id` is not registered.
+    ///
+    /// # Panics
+    /// - `"no warranty registered"` — if no warranty exists.
+    /// - `"warranty is voided"` — if the warranty has been voided.
+    ///
+    /// # Emitted Events
+    /// Publishes `("warranty_claim_filed", product_id)` with the
+    /// [`assembly_warranty::WarrantyClaim`] struct as the body.
+    pub fn file_warranty_claim(
+        env: Env,
+        product_id: String,
+        claim_id: String,
+        description: String,
+        proof_ref: String,
+        claimant: Address,
+    ) -> Result<assembly_warranty::WarrantyClaim, Error> {
+        assembly_warranty::file_warranty_claim(&env, product_id, claim_id, description, proof_ref, claimant)
+    }
+
+    /// Update the status of a warranty claim. Owner-only.
+    ///
+    /// # Parameters
+    /// - `product_id` — ID of the product.
+    /// - `claim_id` — ID of the claim to update.
+    /// - `new_status` — New [`assembly_warranty::ClaimStatus`] value.
+    /// - `caller` — Must be the product owner.
+    ///
+    /// # Errors
+    /// - [`Error::ProductNotFound`] — if `product_id` is not registered.
+    /// - [`Error::NotAuthorized`] — if caller is not the product owner.
+    ///
+    /// # Panics
+    /// - `"claim not found"` — if no claim with `claim_id` exists.
+    ///
+    /// # Emitted Events
+    /// Publishes `("warranty_claim_updated", product_id)` with the updated
+    /// [`assembly_warranty::WarrantyClaim`] struct as the body.
+    pub fn update_claim_status(
+        env: Env,
+        product_id: String,
+        claim_id: String,
+        new_status: assembly_warranty::ClaimStatus,
+        caller: Address,
+    ) -> Result<assembly_warranty::WarrantyClaim, Error> {
+        assembly_warranty::update_claim_status(&env, product_id, claim_id, new_status, caller)
+    }
+
+    /// Return all warranty claims for a product.
+    pub fn list_warranty_claims(
+        env: Env,
+        product_id: String,
+    ) -> Vec<assembly_warranty::WarrantyClaim> {
+        assembly_warranty::list_warranty_claims(&env, product_id)
     }
 }
 

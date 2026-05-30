@@ -1,4 +1,4 @@
-import type { Product, TrackingEvent } from '@/lib/types';
+import type { Product, TrackingEvent, ProductAssembly, WarrantyInfo, WarrantyClaim } from '@/lib/types';
 
 export const MOCK_PRODUCTS: Product[] = [
   {
@@ -36,6 +36,18 @@ export const MOCK_PRODUCTS: Product[] = [
         revoked: false,
       },
     ],
+    // Warranty: 2-year warranty on the coffee batch
+    warranty: {
+      productId: 'prod-001',
+      durationSeconds: 2 * 365 * 24 * 3600,
+      issuer: 'GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+      issuedAt: 1710000000000,
+      terms: 'Quality guarantee: full refund if product does not meet grade specifications.',
+      termsRef: 'ipfs://QmWarrantyDocCoffeeBeans001',
+      voided: false,
+      voidedAt: 0,
+    },
+    warrantyClaims: [],
   },
   {
     id: 'prod-002',
@@ -66,6 +78,58 @@ export const MOCK_PRODUCTS: Product[] = [
         issuer: 'GACTOR3ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567',
         issuedAt: 1711200000000,
         revoked: false,
+      },
+    ],
+    // No warranty on cocoa batch
+  },
+  {
+    id: 'prod-003',
+    name: 'Premium Chocolate Bar',
+    origin: 'Belgium',
+    owner: 'GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+    timestamp: 1712000000000,
+    active: true,
+    authorizedActors: [
+      'GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+      'GACTOR1ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567',
+    ],
+    ownershipHistory: [
+      { owner: 'GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ', transferredAt: 1712000000000 },
+    ],
+    category: 'food',
+    subcategory: 'confectionery',
+    certifications: [],
+    // Assembly: chocolate bar is assembled from coffee beans + cocoa
+    assembly: {
+      parentId: 'prod-003',
+      componentIds: ['prod-001', 'prod-002'],
+      registeredBy: 'GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+      registeredAt: 1712100000000,
+      description:
+        'Premium chocolate bar assembled from Ethiopian organic coffee beans and Ghanaian fair-trade cocoa.',
+    },
+    // Warranty: 1-year product warranty
+    warranty: {
+      productId: 'prod-003',
+      durationSeconds: 365 * 24 * 3600,
+      issuer: 'GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+      issuedAt: 1712000000000,
+      terms:
+        'Manufacturer warranty: replacement or refund for defective products within 1 year of purchase.',
+      termsRef: 'ipfs://QmWarrantyDocChocolateBar003',
+      voided: false,
+      voidedAt: 0,
+    },
+    warrantyClaims: [
+      {
+        claimId: 'claim-003-001',
+        productId: 'prod-003',
+        claimant: 'GCUSTOMER1ABCDEFGHIJKLMNOPQRSTUVWXYZ123',
+        filedAt: 1712500000000,
+        description: 'Packaging was damaged on arrival. Product quality unaffected.',
+        proofRef: 'ipfs://QmClaimProofDamagedPackaging',
+        status: 'Resolved',
+        updatedAt: 1712600000000,
       },
     ],
   },
@@ -150,6 +214,53 @@ export const MOCK_EVENTS: TrackingEvent[] = [
       sustainable_practices: ['agroforestry', 'no_child_labor'],
       renewable_energy_pct: 50,
       recyclable_packaging: false,
+    }),
+  },
+  // Events for the assembled chocolate bar (prod-003)
+  {
+    productId: 'prod-003',
+    eventType: 'PROCESSING',
+    location: 'Brussels, Belgium',
+    actor: 'GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+    timestamp: 1712000000000,
+    metadata: JSON.stringify({
+      process: 'Conching and tempering',
+      lat: 50.8503,
+      lng: 4.3517,
+      carbon_footprint: 20,
+      sustainable_practices: ['renewable_energy'],
+      renewable_energy_pct: 90,
+      recyclable_packaging: true,
+    }),
+  },
+  {
+    productId: 'prod-003',
+    eventType: 'SHIPPING',
+    location: 'Port of Antwerp, Belgium',
+    actor: 'GACTOR1ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567',
+    timestamp: 1712200000000,
+    metadata: JSON.stringify({
+      vessel: 'MV Cocoa Star',
+      destination: 'New York',
+      lat: 51.2194,
+      lng: 4.4025,
+      carbon_footprint: 35,
+      sustainable_practices: ['carbon_offset'],
+    }),
+  },
+  {
+    productId: 'prod-003',
+    eventType: 'RETAIL',
+    location: 'New York, USA',
+    actor: 'GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+    timestamp: 1712400000000,
+    metadata: JSON.stringify({
+      store: 'Artisan Chocolates NYC',
+      lat: 40.7128,
+      lng: -74.006,
+      carbon_footprint: 3,
+      recyclable_packaging: true,
+      renewable_energy_pct: 100,
     }),
   },
 ];
