@@ -38,6 +38,24 @@ export interface Product {
   spoiled?: boolean;
   /** true while an on-chain transaction is in-flight */
   pending?: boolean;
+  /** Whether this product has been recalled (#393) */
+  recalled?: boolean;
+  /** Reason provided when the product was recalled (#393) */
+  recallReason?: string;
+  /** Ledger timestamp when the product was recalled; 0 if never recalled (#393) */
+  recallTimestamp?: number;
+  /** Schema version of this record (#392) */
+  schemaVersion?: number;
+  /** Off-chain image URL stored in product metadata (#112) */
+  imageUrl?: string;
+  /** Taxonomy category ID (#425) */
+  category?: string;
+  /** Taxonomy subcategory ID (#425) */
+  subcategory?: string;
+  /** On-chain certifications attached to this product (#428) */
+  certifications?: Certification[];
+  /** Number of signatures required for events (0 or 1 = immediate, >1 = multi-sig) */
+  requiredSignatures?: number;
 }
 
 export interface Batch {
@@ -184,4 +202,77 @@ export interface Rating {
   stars: number;
   comment: string | null;
   timestamp: number;
+}
+
+// ── Auditor registry types ────────────────────────────────────────────────────
+
+/** A registered auditor who can sign attestations for events and products. */
+export interface Auditor {
+  /** Stellar address of the auditor. */
+  address: string;
+  /** Human-readable name of the auditing organisation. */
+  name: string;
+  /** Whether this auditor registration is currently active. */
+  active: boolean;
+  /** Unix timestamp (seconds) when the auditor was registered. */
+  registeredAt: number;
+}
+
+/**
+ * Attestation type keys from the controlled vocabulary.
+ * Extensible — the contract stores these as free-form strings.
+ */
+export type AttestationType =
+  | 'quality_check'
+  | 'compliance_verified'
+  | 'safety_approved'
+  | 'origin_verified'
+  | 'fair_trade_verified'
+  | 'organic_certified'
+  | string;
+
+/**
+ * A signed attestation from a registered auditor for a product or event.
+ *
+ * The `signature` field carries a hex-encoded Ed25519 signature over the
+ * canonical payload: `product_id|target_id|attestation_type|timestamp`
+ * (UTF-8, pipe-separated).
+ */
+export interface Attestation {
+  /** Stable unique identifier for this attestation. */
+  id: string;
+  /** ID of the product this attestation is for. */
+  productId: string;
+  /**
+   * Stable event ID (`TrackingEvent.stableId`) if attesting a specific event,
+   * or empty string for a product-level attestation.
+   */
+  targetId: string;
+  /** Stellar address of the auditor who signed this attestation. */
+  auditor: string;
+  /** Attestation type key. */
+  attestationType: AttestationType;
+  /** Hex-encoded Ed25519 signature over the canonical payload. */
+  signature: string;
+  /** Unix timestamp (seconds) when the attestation was submitted. */
+  timestamp: number;
+  /** Optional human-readable notes from the auditor. */
+  notes: string;
+}
+
+// ── Batch recall types ────────────────────────────────────────────────────────
+
+/** Batch with recall status fields. */
+export interface BatchWithRecall {
+  id: string;
+  name: string;
+  owner: string;
+  productIds: string[];
+  timestamp: number;
+  /** Whether this batch has been recalled. */
+  recalled: boolean;
+  /** Reason provided when the batch was recalled. */
+  recallReason: string;
+  /** Unix timestamp (seconds) when the batch was recalled; 0 if never recalled. */
+  recallTimestamp: number;
 }
