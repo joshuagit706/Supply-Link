@@ -349,6 +349,71 @@ pub struct DocumentAnchor {
     pub anchored_at: u64,
 }
 
+// ── Issue #495: Actor trust weight and blacklist ──────────────────────────────
+
+/// Trust weight record for an actor (manufacturer/supplier). (#495)
+#[contracttype]
+#[derive(Clone)]
+pub struct ActorTrustWeight {
+    pub actor: Address,
+    pub trust_weight: u32,  // 0-100 scale
+    pub blacklisted: bool,
+    pub blacklist_reason: String,
+    pub last_updated: u64,
+}
+
+// ── Issue #496: Certification chain explorer ──────────────────────────────────
+
+/// Certification chain link showing dependencies between certifications. (#496)
+#[contracttype]
+#[derive(Clone)]
+pub struct CertificationChainLink {
+    pub from_cert_id: String,
+    pub to_cert_id: String,
+    pub link_type: String,  // "depends_on", "supersedes", "related"
+    pub created_at: u64,
+}
+
+// ── Issue #497: Multi-stage recall with jurisdiction ────────────────────────
+
+/// Recall stage with jurisdiction scope. (#497)
+#[contracttype]
+#[derive(Clone)]
+pub struct RecallStage {
+    pub stage_id: String,
+    pub product_id: String,
+    pub jurisdiction: String,  // ISO 3166-1 alpha-2 code or "GLOBAL"
+    pub stage_type: String,    // "INITIATED", "IN_PROGRESS", "COMPLETED"
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+// ── Issue #498: Provenance badge issuer registry ────────────────────────────
+
+/// Registered badge issuer for provenance validation. (#498)
+#[contracttype]
+#[derive(Clone)]
+pub struct BadgeIssuer {
+    pub issuer: Address,
+    pub issuer_name: String,
+    pub badge_type: String,  // "ORGANIC", "FAIR_TRADE", "ISO_9001", etc.
+    pub trusted: bool,
+    pub registered_at: u64,
+}
+
+/// Provenance badge issued by a trusted validator. (#498)
+#[contracttype]
+#[derive(Clone)]
+pub struct ProvenanceBadge {
+    pub badge_id: String,
+    pub product_id: String,
+    pub issuer: Address,
+    pub badge_type: String,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub revoked: bool,
+}
+
 // ── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -379,6 +444,16 @@ pub enum DataKey {
     CompliancePolicy(String),
     /// Key for document anchors for a product. The inner `String` is the product ID. (#460)
     DocumentAnchors(String),
+    /// Actor trust weight record keyed by Address. (#495)
+    ActorTrustWeight(Address),
+    /// Certification chain links for a product. (#496)
+    CertificationChainLinks(String),
+    /// Recall stages for a product. (#497)
+    RecallStages(String),
+    /// Badge issuer registry keyed by Address. (#498)
+    BadgeIssuer(Address),
+    /// Provenance badges for a product. (#498)
+    ProvenanceBadges(String),
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -1221,6 +1296,299 @@ o            actor: caller,
             escrow.clone(),
         );
         escrow
+    }
+
+    // ── Issue #495: Actor trust weight and blacklist ──────────────────────────
+
+    /// Set or update the trust weight for an actor. Owner-only.
+    pub fn set_actor_trust_weight(
+        env: Env,
+        actor: Address,
+        trust_weight: u32,
+    ) -> ActorTrustWeight {
+        if trust_weight > 100 {
+            panic!("trust_weight must be 0-100");
+        }
+
+        let trust_record = ActorTrustWeight {
+            actor: actor.clone(),
+            trust_weight,
+            blacklisted: false,
+            blacklist_reason: String::from_str(&env, ""),
+            last_updated: env.ledger().timestamp(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActorTrustWeight(actor.clone()), &trust_record);
+
+        env.events().publish(
+            (Symbol::new(&env, "trust_weight_updated"), actor),
+            trust_weight,
+        );
+
+        trust_record
+    }
+
+    /// Blacklist an actor and reduce their trust weight. Owner-only.
+    pub fn blacklist_actor(
+        env: Env,
+        actor: Address,
+        reason: String,
+    ) -> ActorTrustWeight {
+        let mut trust_record: ActorTrustWeight = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActorTrustWeight(actor.clone()))
+            .unwrap_or(ActorTrustWeight {
+                actor: actor.clone(),
+                trust_weight: 0,
+                blacklisted: false,
+                blacklist_reason: String::from_str(&env, ""),
+                last_updated: 0,
+            });
+
+        trust_record.blacklisted = true;
+        trust_record.blacklist_reason = reason;
+        trust_record.trust_weight = 0;
+        trust_record.last_updated = env.ledger().timestamp();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActorTrustWeight(actor.clone()), &trust_record);
+
+        env.events().publish(
+            (Symbol::new(&env, "actor_blacklisted"), actor),
+            trust_record.clone(),
+        );
+
+        trust_record
+    }
+
+    /// Get the trust weight for an actor.
+    pub fn get_actor_trust_weight(env: Env, actor: Address) -> ActorTrustWeight {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ActorTrustWeight(actor.clone()))
+            .unwrap_or(ActorTrustWeight {
+                actor,
+                trust_weight: 50,  // Default neutral trust
+                blacklisted: false,
+                blacklist_reason: String::from_str(&env, ""),
+                last_updated: 0,
+            })
+    }
+
+    // ── Issue #496: Certification chain explorer ──────────────────────────────
+
+    /// Add a certification chain link between two certifications.
+    pub fn add_certification_chain_link(
+        env: Env,
+        from_cert_id: String,
+        to_cert_id: String,
+        link_type: String,
+    ) -> CertificationChainLink {
+        let link = CertificationChainLink {
+            from_cert_id: from_cert_id.clone(),
+            to_cert_id: to_cert_id.clone(),
+            link_type: link_type.clone(),
+            created_at: env.ledger().timestamp(),
+        };
+
+        let product_id = from_cert_id.clone();
+        let mut links: Vec<CertificationChainLink> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CertificationChainLinks(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        links.push_back(link.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::CertificationChainLinks(product_id), &links);
+
+        env.events().publish(
+            (Symbol::new(&env, "cert_chain_link_added"), from_cert_id),
+            link.clone(),
+        );
+
+        link
+    }
+
+    /// Get all certification chain links for a product.
+    pub fn get_certification_chain_links(
+        env: Env,
+        product_id: String,
+    ) -> Vec<CertificationChainLink> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CertificationChainLinks(product_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // ── Issue #497: Multi-stage recall with jurisdiction ────────────────────
+
+    /// Create a recall stage for a product in a specific jurisdiction.
+    pub fn create_recall_stage(
+        env: Env,
+        product_id: String,
+        jurisdiction: String,
+        stage_type: String,
+    ) -> RecallStage {
+        let stage_id = format!("{}-{}-{}", &product_id, &jurisdiction, env.ledger().timestamp());
+
+        let stage = RecallStage {
+            stage_id: stage_id.clone(),
+            product_id: product_id.clone(),
+            jurisdiction,
+            stage_type,
+            created_at: env.ledger().timestamp(),
+            updated_at: env.ledger().timestamp(),
+        };
+
+        let mut stages: Vec<RecallStage> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RecallStages(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        stages.push_back(stage.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::RecallStages(product_id), &stages);
+
+        env.events().publish(
+            (Symbol::new(&env, "recall_stage_created"), stage_id),
+            stage.clone(),
+        );
+
+        stage
+    }
+
+    /// Get all recall stages for a product.
+    pub fn get_recall_stages(env: Env, product_id: String) -> Vec<RecallStage> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RecallStages(product_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // ── Issue #498: Provenance badge issuer registry ────────────────────────
+
+    /// Register a trusted badge issuer.
+    pub fn register_badge_issuer(
+        env: Env,
+        issuer: Address,
+        issuer_name: String,
+        badge_type: String,
+    ) -> BadgeIssuer {
+        let badge_issuer = BadgeIssuer {
+            issuer: issuer.clone(),
+            issuer_name,
+            badge_type,
+            trusted: true,
+            registered_at: env.ledger().timestamp(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::BadgeIssuer(issuer.clone()), &badge_issuer);
+
+        env.events().publish(
+            (Symbol::new(&env, "badge_issuer_registered"), issuer),
+            badge_issuer.clone(),
+        );
+
+        badge_issuer
+    }
+
+    /// Issue a provenance badge for a product.
+    pub fn issue_provenance_badge(
+        env: Env,
+        product_id: String,
+        issuer: Address,
+        badge_type: String,
+        expires_at: u64,
+    ) -> ProvenanceBadge {
+        // Verify issuer is registered and trusted
+        let issuer_record: BadgeIssuer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BadgeIssuer(issuer.clone()))
+            .expect("issuer not registered");
+
+        if !issuer_record.trusted {
+            panic!("issuer is not trusted");
+        }
+
+        let badge_id = format!("{}-{}-{}", &product_id, &badge_type, env.ledger().timestamp());
+
+        let badge = ProvenanceBadge {
+            badge_id: badge_id.clone(),
+            product_id: product_id.clone(),
+            issuer: issuer.clone(),
+            badge_type,
+            issued_at: env.ledger().timestamp(),
+            expires_at,
+            revoked: false,
+        };
+
+        let mut badges: Vec<ProvenanceBadge> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProvenanceBadges(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        badges.push_back(badge.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProvenanceBadges(product_id), &badges);
+
+        env.events().publish(
+            (Symbol::new(&env, "badge_issued"), badge_id),
+            badge.clone(),
+        );
+
+        badge
+    }
+
+    /// Get all provenance badges for a product.
+    pub fn get_provenance_badges(env: Env, product_id: String) -> Vec<ProvenanceBadge> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProvenanceBadges(product_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Revoke a provenance badge.
+    pub fn revoke_provenance_badge(env: Env, product_id: String, badge_id: String) -> bool {
+        let mut badges: Vec<ProvenanceBadge> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProvenanceBadges(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut found = false;
+        for i in 0..badges.len() {
+            let mut badge = badges.get(i).unwrap();
+            if badge.badge_id == badge_id {
+                badge.revoked = true;
+                found = true;
+            }
+        }
+
+        if found {
+            env.storage()
+                .persistent()
+                .set(&DataKey::ProvenanceBadges(product_id), &badges);
+
+            env.events().publish(
+                (Symbol::new(&env, "badge_revoked"), badge_id),
+                true,
+            );
+        }
+
+        found
     }
 }
 
