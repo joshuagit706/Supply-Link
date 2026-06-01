@@ -1,112 +1,119 @@
 /**
- * GET  /api/v1/attestations?productId=...  – list attestations for a product
- * POST /api/v1/attestations                – submit a new attestation
+ * POST /api/v1/attestations  — Add an attestation to a product
+ * GET  /api/v1/attestations  — List attestations (by productId or issuerAddress)
  *
- * Authentication: x-api-key (partner)
- * Rate limiting: default tier
- * Idempotency: POST requests via Idempotency-Key header
+ * Authentication: auditor tier or higher (x-api-key)
+ * Rate limiting: default preset
  */
 
 import { NextRequest, NextResponse } from 'next/server';
+import { z } from 'zod';
 import { withCors, handleOptions } from '@/lib/api/cors';
 import { apiError, withCorrelationId, ErrorCode } from '@/lib/api/errors';
 import { applyRateLimit, RATE_LIMIT_PRESETS } from '@/lib/api/rateLimit';
-import { authenticateApiRequest } from '@/lib/api/auth';
+import { authenticateRegistryKey } from '@/lib/api/apiKeyAuth';
 import { withIdempotency } from '@/lib/api/idempotency';
 import { recordRequest } from '@/lib/api/metrics';
 import {
-  MOCK_ATTESTATIONS,
-  MOCK_AUDITORS,
-  getAttestationsByProductId,
-} from '@/lib/mock/auditors';
-import type { Attestation, PaginatedResponse } from '@/lib/types';
+  addAttestation,
+  listAttestationsForProduct,
+  listAttestationsByIssuer,
+} from '@/lib/attestations';
+
+export const runtime = 'nodejs';
+
+// ── Validation ────────────────────────────────────────────────────────────────
+
+const addAttestationSchema = z.object({
+  productId: z
+    .string()
+    .trim()
+    .min(1, 'productId is required')
+    .max(128, 'productId must be 128 characters or fewer'),
+  issuerAddress: z
+    .string()
+    .trim()
+    .min(1, 'issuerAddress is required')
+    .max(256, 'issuerAddress must be 256 characters or fewer'),
+  issuerName: z
+    .string()
+    .trim()
+    .min(1, 'issuerName is required')
+    .max(256, 'issuerName must be 256 characters or fewer'),
+  trustLevel: z.enum(['verified', 'trusted', 'community'] as const),
+  attestationType: z.enum([
+    'audit',
+    'certification',
+    'inspection',
+    'compliance',
+    'sustainability',
+    'custom',
+  ] as const),
+  summary: z
+    .string()
+    .trim()
+    .min(1, 'summary is required')
+    .max(512, 'summary must be 512 characters or fewer'),
+  signedReference: z
+    .string()
+    .trim()
+    .min(1, 'signedReference is required')
+    .max(2048, 'signedReference must be 2048 characters or fewer'),
+  reportUrl: z.string().url('reportUrl must be a valid URL').optional(),
+  expiresInDays: z.number().int().min(1).max(3650).optional(),
+  metadata: z.string().max(4096, 'metadata must be 4096 characters or fewer').optional(),
+});
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
 
 export function OPTIONS(request: NextRequest) {
   return handleOptions(request);
 }
 
-async function listAttestations(req: NextRequest): Promise<NextResponse> {
-  const productId = req.nextUrl.searchParams.get('productId');
-  const targetId = req.nextUrl.searchParams.get('targetId');
-  const offset = parseInt(req.nextUrl.searchParams.get('offset') ?? '0', 10);
-  const limit = Math.min(parseInt(req.nextUrl.searchParams.get('limit') ?? '50', 10), 100);
+export async function POST(request: NextRequest): Promise<NextResponse> {
+  const start = Date.now();
 
-  if (!productId) {
-    return apiError(req, 400, ErrorCode.MISSING_FIELDS, 'Missing required query param: productId');
-  }
-  if (offset < 0 || limit < 1) {
-    return apiError(req, 400, ErrorCode.VALIDATION_ERROR, 'Invalid offset or limit');
+  const limited = applyRateLimit(request, 'POST /api/v1/attestations', RATE_LIMIT_PRESETS.default);
+  if (limited) {
+    recordRequest('POST /api/v1/attestations', 429, Date.now() - start);
+    return limited;
   }
 
-  let all = getAttestationsByProductId(productId);
-
-  // Optionally filter by targetId (event-level vs product-level)
-  if (targetId !== null) {
-    all = all.filter((a) => a.targetId === targetId);
+  // Auditor tier or higher required
+  const auth = await authenticateRegistryKey(request, 'auditor', 'POST /api/v1/attestations');
+  if (auth.error) {
+    recordRequest('POST /api/v1/attestations', 401, Date.now() - start);
+    return auth.error;
   }
 
-  const items = all.slice(offset, offset + limit);
-
-  const response: PaginatedResponse<Attestation> = {
-    items,
-    total: all.length,
-    offset,
-    limit,
-  };
-
-  return withCors(req, withCorrelationId(req, NextResponse.json(response, { status: 200 })));
-}
-
-async function submitAttestation(req: NextRequest, rawBody: string): Promise<NextResponse> {
-  let payload: unknown;
-  try {
-    payload = JSON.parse(rawBody);
-  } catch {
-    return apiError(req, 400, ErrorCode.INVALID_PAYLOAD, 'Invalid JSON');
-  }
-
-  const body = payload as Record<string, unknown>;
-
-  // Validate required fields
-  const requiredFields = ['productId', 'auditor', 'attestationId', 'attestationType', 'signature'];
-  for (const field of requiredFields) {
-    if (typeof body[field] !== 'string' || !(body[field] as string).trim()) {
-      return apiError(req, 400, ErrorCode.MISSING_FIELDS, `Missing or invalid: ${field}`);
+  const response = await withIdempotency(request, async (req, rawBody) => {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(rawBody);
+    } catch {
+      return withCors(req, apiError(req, 400, ErrorCode.INVALID_JSON, 'Invalid JSON body'));
     }
-  }
 
-  const auditorAddress = body.auditor as string;
-  const auditor = MOCK_AUDITORS.find((a) => a.address === auditorAddress);
+    const parsed = addAttestationSchema.safeParse(payload);
+    if (!parsed.success) {
+      const details = parsed.error.issues.map((i) => ({
+        field: i.path.join('.'),
+        location: 'body' as const,
+        message: i.message,
+      }));
+      return withCors(
+        req,
+        apiError(req, 400, ErrorCode.VALIDATION_ERROR, 'Validation failed', { details }),
+      );
+    }
 
-  // Only registered auditors may submit attestations
-  if (!auditor) {
-    return apiError(req, 403, ErrorCode.VALIDATION_ERROR, 'Auditor not registered');
-  }
-  if (!auditor.active) {
-    return apiError(req, 403, ErrorCode.VALIDATION_ERROR, 'Auditor is not active');
-  }
+    const record = await addAttestation(parsed.data);
 
-  // Check for duplicate attestation ID
-  const duplicate = MOCK_ATTESTATIONS.find((a) => a.id === body.attestationId);
-  if (duplicate) {
-    return apiError(req, 409, ErrorCode.VALIDATION_ERROR, 'Attestation ID already exists');
-  }
+    return withCors(req, withCorrelationId(req, NextResponse.json(record, { status: 201 })));
+  });
 
-  const newAttestation: Attestation = {
-    id: body.attestationId as string,
-    productId: body.productId as string,
-    targetId: typeof body.targetId === 'string' ? body.targetId : '',
-    auditor: auditorAddress,
-    attestationType: body.attestationType as string,
-    signature: body.signature as string,
-    timestamp: Math.floor(Date.now() / 1000),
-    notes: typeof body.notes === 'string' ? body.notes : '',
-  };
-
-  // TODO: Persist via Soroban contract call: submit_attestation(...)
-  MOCK_ATTESTATIONS.push(newAttestation);
-
-  return withCors(req, withCorrelationId(req, NextResponse.json(newAttestation, { status: 201 })));
+  recordRequest('POST /api/v1/attestations', response.status, Date.now() - start);
+  return response;
 }
 
 export async function GET(request: NextRequest): Promise<NextResponse> {
@@ -122,40 +129,35 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     return limited;
   }
 
-  const auth = await authenticateApiRequest(request, 'partner');
-  if (auth.error) {
-    recordRequest('GET /api/v1/attestations', 401, Date.now() - start);
-    return auth.error;
+  const productId = request.nextUrl.searchParams.get('productId');
+  const issuerAddress = request.nextUrl.searchParams.get('issuerAddress');
+
+  if (!productId && !issuerAddress) {
+    const res = withCors(
+      request,
+      apiError(
+        request,
+        400,
+        ErrorCode.VALIDATION_ERROR,
+        'Provide either productId or issuerAddress query parameter',
+      ),
+    );
+    recordRequest('GET /api/v1/attestations', 400, Date.now() - start);
+    return res;
   }
 
-  const response = await listAttestations(request);
-  recordRequest('GET /api/v1/attestations', response.status, Date.now() - start);
-  return response;
-}
+  const attestations = productId
+    ? await listAttestationsForProduct(productId)
+    : await listAttestationsByIssuer(issuerAddress!);
 
-export async function POST(request: NextRequest): Promise<NextResponse> {
-  const start = Date.now();
-
-  const limited = applyRateLimit(
+  const response = withCors(
     request,
-    'POST /api/v1/attestations',
-    RATE_LIMIT_PRESETS.default,
-  );
-  if (limited) {
-    recordRequest('POST /api/v1/attestations', 429, Date.now() - start);
-    return limited;
-  }
-
-  const auth = await authenticateApiRequest(request, 'partner');
-  if (auth.error) {
-    recordRequest('POST /api/v1/attestations', 401, Date.now() - start);
-    return auth.error;
-  }
-
-  const response = await withIdempotency(request, (req, rawBody) =>
-    submitAttestation(req, rawBody),
+    withCorrelationId(
+      request,
+      NextResponse.json({ attestations, total: attestations.length }, { status: 200 }),
+    ),
   );
 
-  recordRequest('POST /api/v1/attestations', response.status, Date.now() - start);
+  recordRequest('GET /api/v1/attestations', response.status, Date.now() - start);
   return response;
 }

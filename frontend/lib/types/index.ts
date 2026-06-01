@@ -1,12 +1,96 @@
 export type EventType = 'HARVEST' | 'PROCESSING' | 'SHIPPING' | 'RETAIL';
 export type ProductStatus = 'active' | 'inactive';
 
+// ── #479 Provenance-based pricing ─────────────────────────────────────────────
+
+/** A single pricing adjustment rule keyed to a provenance score range. */
+export interface PricingAdjustmentRule {
+  /** Minimum provenance score percentage (0–100) for this rule to apply. */
+  minScore: number;
+  /** Maximum provenance score percentage (0–100) for this rule to apply. */
+  maxScore: number;
+  /** Multiplier applied to base price (e.g. 1.1 = +10%, 0.9 = -10%). */
+  multiplier: number;
+  /** Human-readable label for this tier (e.g. "Premium", "Standard"). */
+  label: string;
+}
+
+/** Pricing metadata attached to a product. */
+export interface ProductPricingMetadata {
+  /** Base price in the smallest unit of the currency (e.g. cents). */
+  basePrice: number;
+  /** ISO 4217 currency code (e.g. "USD"). */
+  currency: string;
+  /** Ordered list of adjustment rules; first matching rule wins. */
+  adjustmentRules: PricingAdjustmentRule[];
+}
+
+/** Result of applying provenance-based pricing to a product. */
+export interface AdjustedPriceResult {
+  basePrice: number;
+  currency: string;
+  adjustedPrice: number;
+  appliedRule: PricingAdjustmentRule | null;
+  provenanceScore: number;
+}
+
+// ── #478 Guardian handover ────────────────────────────────────────────────────
+
+export type GuardianHandoverStatus = 'proposed' | 'accepted' | 'cancelled' | 'completed';
+
+/** A pending guardian handover proposal. */
+export interface GuardianHandoverProposal {
+  productId: string;
+  currentGuardian: string;
+  proposedGuardian: string;
+  proposedAt: number;
+  status: GuardianHandoverStatus;
+  /** Nonce used to prevent replay attacks. */
+  nonce: number;
+}
+
+// ── #476 Event sequence / replay protection ───────────────────────────────────
+
+/** Per-product event sequence state stored in KV. */
+export interface ProductEventSequence {
+  productId: string;
+  /** Monotonically increasing sequence number; next event must use this value. */
+  nextSeq: number;
+  /** Timestamp of the last accepted event. */
+  lastEventAt: number;
+}
+
+/** Conflict detected when two clients submit events with the same sequence number. */
+export interface EventSequenceConflict {
+  productId: string;
+  expectedSeq: number;
+  receivedSeq: number;
+}
+
+// ── #475 Async validation pipeline ───────────────────────────────────────────
+
+export type ValidationStatus = 'pending' | 'passed' | 'failed' | 'skipped';
+
+export interface EventValidationResult {
+  eventStableId: string;
+  productId: string;
+  status: ValidationStatus;
+  checks: ValidationCheck[];
+  validatedAt?: number;
+}
+
+export interface ValidationCheck {
+  name: string;
+  status: ValidationStatus;
+  message?: string;
+}
+
 export interface TemplateStage {
   label: string;
   eventType: EventType;
 }
 
-export type ActorRole = "Producer" | "Processor" | "Shipper" | "Retailer" | "Any";
+export type ActorRole = 'Producer' | 'Processor' | 'Shipper' | 'Retailer' | 'Any';
 
 export interface OwnershipRecord {
   owner: string;
@@ -38,24 +122,8 @@ export interface Product {
   spoiled?: boolean;
   /** true while an on-chain transaction is in-flight */
   pending?: boolean;
-  /** Whether this product has been recalled (#393) */
-  recalled?: boolean;
-  /** Reason provided when the product was recalled (#393) */
-  recallReason?: string;
-  /** Ledger timestamp when the product was recalled; 0 if never recalled (#393) */
-  recallTimestamp?: number;
-  /** Schema version of this record (#392) */
-  schemaVersion?: number;
-  /** Off-chain image URL stored in product metadata (#112) */
-  imageUrl?: string;
-  /** Taxonomy category ID (#425) */
-  category?: string;
-  /** Taxonomy subcategory ID (#425) */
-  subcategory?: string;
-  /** On-chain certifications attached to this product (#428) */
-  certifications?: Certification[];
-  /** Number of signatures required for events (0 or 1 = immediate, >1 = multi-sig) */
-  requiredSignatures?: number;
+  hazardous?: boolean;
+  hazardClassification?: string;
 }
 
 export interface Batch {
@@ -102,6 +170,10 @@ export interface TrackingEvent {
   metadata: string;
   stableId?: string;
   pending?: boolean;
+  /** Monotonic sequence number for replay protection (#476) */
+  seq?: number;
+  /** Async validation status for this event (#475) */
+  validationStatus?: ValidationStatus;
 }
 
 /** Pending ownership transfer escrow (#396) */
@@ -129,6 +201,9 @@ export interface PendingEvent {
 
 export interface EventPage {
   events: TrackingEvent[];
+  total: number;
+  offset: number;
+  limit: number;
   /** Stable deterministic event ID — SHA-256 hex (#386) */
   stableId?: string;
   /** true while an on-chain transaction is in-flight (#49) */
@@ -137,8 +212,6 @@ export interface EventPage {
   schemaVersion?: number;
 }
 
-export interface EventPage {
-  events: TrackingEvent[];
 export interface PendingEvent {
   pendingEventId: number;
   productId: string;
@@ -195,6 +268,8 @@ export interface EventFilter {
   actor?: string | null;
   fromTimestamp?: number | null;
   toTimestamp?: number | null;
+}
+
 export interface Rating {
   id: string;
   productId: string;
@@ -204,75 +279,12 @@ export interface Rating {
   timestamp: number;
 }
 
-// ── Auditor registry types ────────────────────────────────────────────────────
-
-/** A registered auditor who can sign attestations for events and products. */
-export interface Auditor {
-  /** Stellar address of the auditor. */
-  address: string;
-  /** Human-readable name of the auditing organisation. */
-  name: string;
-  /** Whether this auditor registration is currently active. */
-  active: boolean;
-  /** Unix timestamp (seconds) when the auditor was registered. */
-  registeredAt: number;
-}
-
-/**
- * Attestation type keys from the controlled vocabulary.
- * Extensible — the contract stores these as free-form strings.
- */
-export type AttestationType =
-  | 'quality_check'
-  | 'compliance_verified'
-  | 'safety_approved'
-  | 'origin_verified'
-  | 'fair_trade_verified'
-  | 'organic_certified'
-  | string;
-
-/**
- * A signed attestation from a registered auditor for a product or event.
- *
- * The `signature` field carries a hex-encoded Ed25519 signature over the
- * canonical payload: `product_id|target_id|attestation_type|timestamp`
- * (UTF-8, pipe-separated).
- */
-export interface Attestation {
-  /** Stable unique identifier for this attestation. */
-  id: string;
-  /** ID of the product this attestation is for. */
+/** An off-chain document anchored on-chain by its SHA-256 hash. (#460) */
+export interface DocumentAnchor {
   productId: string;
-  /**
-   * Stable event ID (`TrackingEvent.stableId`) if attesting a specific event,
-   * or empty string for a product-level attestation.
-   */
-  targetId: string;
-  /** Stellar address of the auditor who signed this attestation. */
-  auditor: string;
-  /** Attestation type key. */
-  attestationType: AttestationType;
-  /** Hex-encoded Ed25519 signature over the canonical payload. */
-  signature: string;
-  /** Unix timestamp (seconds) when the attestation was submitted. */
-  timestamp: number;
-  /** Optional human-readable notes from the auditor. */
-  notes: string;
-}
-
-// ── Batch recall types ────────────────────────────────────────────────────────
-
-/** Batch with recall status fields. */
-export interface BatchWithRecall {
-  id: string;
-  name: string;
-  owner: string;
-  productIds: string[];
-  timestamp: number;
-  /** Whether this batch has been recalled. */
-  recalled: boolean;
-  /** Reason provided when the batch was recalled. */
-  recallReason: string;
-  /** Unix timestamp (seconds) when the batch was recalled; 0 if never recalled. */
-  recallTimestamp: number;
+  label: string;
+  /** Hex-encoded SHA-256 digest (64 chars). */
+  hash: string;
+  anchoredBy: string;
+  anchoredAt: number;
 }

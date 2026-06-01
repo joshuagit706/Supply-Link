@@ -20,6 +20,8 @@ import { CertificationsPanel } from '@/components/products/CertificationBadge';
 import { AuditorAttestationsPanel } from '@/components/products/AuditorAttestationsPanel';
 import { BatchRecallBanner } from '@/components/products/BatchRecallBanner';
 import { getCategoryLabel, getSubcategoryLabel } from '@/lib/taxonomy';
+import { AnchorDocumentForm } from '@/components/products/AnchorDocumentForm';
+import { DocumentAnchorsPanel } from '@/components/products/DocumentAnchorsPanel';
 
 interface Props {
   params: { id: string };
@@ -68,6 +70,16 @@ export default function ProductDetailPage({ params }: Props) {
         </div>
         <ProductQRCode productId={p.id} size={160} />
       </div>
+
+      {p.hazardous && (
+        <section className="border border-red-200 bg-red-50 rounded-xl p-4 mb-6">
+          <div className="flex items-center gap-2 text-red-800">
+            <span className="text-xl">⚠️</span>
+            <h2 className="text-base font-bold">Hazardous Material</h2>
+          </div>
+          <p className="text-sm text-red-700 mt-1">Classification: {p.hazardClassification}</p>
+        </section>
+      )}
 
       {/* Product Fields */}
       <section className="border border-[var(--card-border)] bg-[var(--card)] rounded-xl p-6 mb-6">
@@ -179,6 +191,18 @@ export default function ProductDetailPage({ params }: Props) {
         <div className="flex flex-col sm:flex-row gap-3">
           <DownloadBadgeButton product={p} />
           <DownloadCertificateButton product={p} events={events} />
+        </div>
+      </section>
+
+      {/* Document Anchors (#460) */}
+      <section className="border border-[var(--card-border)] bg-[var(--card)] rounded-xl p-6 mb-6">
+        <h2 className="text-base font-semibold mb-4 text-[var(--foreground)]">Document Anchors</h2>
+        <DocumentAnchorsPanel anchors={[]} />
+        <div className="mt-6 border-t border-[var(--card-border)] pt-4">
+          <h3 className="text-sm font-medium text-[var(--foreground)] mb-3">
+            Anchor a new document
+          </h3>
+          <AnchorDocumentForm productId={p.id} />
         </div>
       </section>
 
