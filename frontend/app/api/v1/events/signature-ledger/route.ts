@@ -1,16 +1,16 @@
 /**
  * GET /api/v1/events/signature-ledger?productId=<id>
  *
- * Export a product's event signature ledger for audit purposes.
- * Returns signer addresses, event hashes, and timestamps.
+ * Export a product's chain-of-custody signature ledger for audit purposes.
+ * Each entry includes a SHA-256 event hash and a prevHash anchor that chains
+ * entries together — any tampering breaks the hash chain.
  *
  * Query params:
- *   productId  (required) — product to export
- *   offset     (optional) — pagination offset, default 0
- *   limit      (optional) — max events per page, default 100, max 500
+ *   productId  (required)
+ *   offset     (optional, default 0)
+ *   limit      (optional, default 100, max 500)
  *
  * Authentication: partner tier or higher (x-api-key)
- * Rate limiting: publicRead preset
  */
 
 import { NextRequest, NextResponse } from 'next/server';
@@ -24,23 +24,33 @@ import { createHash } from 'crypto';
 
 export const runtime = 'nodejs';
 
-interface SignatureLedgerEntry {
+export interface CustodyEntry {
   eventIndex: number;
   productId: string;
   eventType: string;
   signerAddress: string;
   eventHash: string;
+  /** SHA-256 of the previous entry's eventHash, or '0'.repeat(64) for the first entry. */
+  prevHash: string;
+  /** SHA-256(eventHash + prevHash) — the chain anchor for this entry. */
+  chainAnchor: string;
   timestamp: number;
   location: string;
 }
 
-interface SignatureLedgerResponse {
+export interface SignatureLedgerResponse {
   productId: string;
   totalEvents: number;
   offset: number;
   limit: number;
-  entries: SignatureLedgerEntry[];
+  entries: CustodyEntry[];
   exportedAt: string;
+}
+
+const GENESIS_HASH = '0'.repeat(64);
+
+function sha256(data: string): string {
+  return createHash('sha256').update(data).digest('hex');
 }
 
 function hashEvent(
@@ -50,8 +60,7 @@ function hashEvent(
   timestamp: number,
   metadata: string,
 ): string {
-  const canonical = `${productId}|${actor}|${eventType}|${timestamp}|${metadata}`;
-  return createHash('sha256').update(canonical).digest('hex');
+  return sha256(`${productId}|${actor}|${eventType}|${timestamp}|${metadata}`);
 }
 
 export function OPTIONS(request: NextRequest) {
@@ -104,24 +113,44 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   }
 
   const allEvents = getEventsByProductId(productId).sort((a, b) => a.timestamp - b.timestamp);
+  const page = allEvents.slice(offset, offset + limit);
 
-  const entries: SignatureLedgerEntry[] = allEvents
-    .slice(offset, offset + limit)
-    .map((event, idx) => ({
+  // Build the hash chain. For paginated requests we need the anchor of the
+  // entry just before the page window so the chain is continuous.
+  let prevHash = GENESIS_HASH;
+  if (offset > 0) {
+    // Recompute chain up to offset to get the correct prevHash
+    for (let i = 0; i < offset && i < allEvents.length; i++) {
+      const e = allEvents[i];
+      const eventHash = hashEvent(e.product_id, e.actor, e.event_type, e.timestamp, e.metadata);
+      const chainAnchor = sha256(eventHash + prevHash);
+      prevHash = chainAnchor;
+    }
+  }
+
+  const entries: CustodyEntry[] = page.map((event, idx) => {
+    const eventHash = hashEvent(
+      event.product_id,
+      event.actor,
+      event.event_type,
+      event.timestamp,
+      event.metadata,
+    );
+    const chainAnchor = sha256(eventHash + prevHash);
+    const entry: CustodyEntry = {
       eventIndex: offset + idx,
       productId: event.product_id,
       eventType: event.event_type,
       signerAddress: event.actor,
-      eventHash: hashEvent(
-        event.product_id,
-        event.actor,
-        event.event_type,
-        event.timestamp,
-        event.metadata,
-      ),
+      eventHash,
+      prevHash,
+      chainAnchor,
       timestamp: event.timestamp,
       location: event.location,
-    }));
+    };
+    prevHash = chainAnchor;
+    return entry;
+  });
 
   const payload: SignatureLedgerResponse = {
     productId,

@@ -1,12 +1,13 @@
-"use client";
+'use client';
 
-import { useRef, useState } from "react";
-import Image from "next/image";
-import { ImagePlus, X, Loader2 } from "lucide-react";
+import { useRef, useState } from 'react';
+import Image from 'next/image';
+import { ImagePlus, X, Loader2 } from 'lucide-react';
+import { computeFileHash } from '@/lib/utils/metadata';
 
 interface ImageUploadProps {
   value?: string;
-  onChange: (url: string | undefined) => void;
+  onChange: (url: string | undefined, contentHash?: string) => void;
 }
 
 export function ImageUpload({ value, onChange }: ImageUploadProps) {
@@ -18,14 +19,18 @@ export function ImageUpload({ value, onChange }: ImageUploadProps) {
     setError(null);
     setUploading(true);
     try {
+      // Compute SHA-256 hash before upload so the caller can store it as an
+      // on-chain commitment and later verify the downloaded asset hasn't changed.
+      const contentHash = await computeFileHash(file);
+
       const form = new FormData();
-      form.append("file", file);
-      const res = await fetch("/api/v1/upload", { method: "POST", body: form });
+      form.append('file', file);
+      const res = await fetch('/api/v1/upload', { method: 'POST', body: form });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Upload failed");
-      onChange(data.url);
+      if (!res.ok) throw new Error(data.error ?? 'Upload failed');
+      onChange(data.url, contentHash);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Upload failed");
+      setError(err instanceof Error ? err.message : 'Upload failed');
     } finally {
       setUploading(false);
     }
@@ -81,7 +86,7 @@ export function ImageUpload({ value, onChange }: ImageUploadProps) {
         onChange={(e) => {
           const file = e.target.files?.[0];
           if (file) handleFile(file);
-          e.target.value = "";
+          e.target.value = '';
         }}
       />
 

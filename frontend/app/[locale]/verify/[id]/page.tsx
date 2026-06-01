@@ -11,6 +11,7 @@ import { ShareButton } from '@/components/ui/ShareButton';
 import { ProvenanceScoreGauge } from '@/components/products/ProvenanceScoreGauge';
 import ProductVerifyClient from './ProductVerifyClient';
 import { DocumentAnchorsPanel } from '@/components/products/DocumentAnchorsPanel';
+import { recordReadAccess, anonymousActor } from '@/lib/services/readAccessAudit';
 
 interface Props {
   params: Promise<{ id: string; locale: string }>;
@@ -57,6 +58,15 @@ export default async function VerifyPage({ params }: Props) {
     getTrackingEvents(id),
     getTranslations({ locale, namespace: 'verify' }),
   ]);
+
+  // Record read access for audit log
+  recordReadAccess({
+    operation: 'product.verify',
+    productIds: [id],
+    actor: anonymousActor(),
+    requestPath: `/${locale}/verify/${id}`,
+    responseStatus: product ? 200 : 404,
+  });
 
   if (!product) {
     return (
@@ -117,7 +127,19 @@ export default async function VerifyPage({ params }: Props) {
             {t('owner')}: {product.owner}
           </p>
         </div>
-        <ProductQRCode productId={product.id} size={140} />
+        <ProductQRCode
+          productId={product.id}
+          size={140}
+          proof={
+            {
+              id: product.id,
+              name: product.name,
+              origin: product.origin,
+              owner: product.owner,
+              ts: product.timestamp,
+            } satisfies QrProofPayload
+          }
+        />
       </div>
 
       {product.hazardous && (
