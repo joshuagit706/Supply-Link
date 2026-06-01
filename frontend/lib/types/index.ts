@@ -170,6 +170,8 @@ export interface TrackingEvent {
   metadata: string;
   stableId?: string;
   pending?: boolean;
+  /** Whether this event has been archived (excluded from active timeline). */
+  archived?: boolean;
   /** Monotonic sequence number for replay protection (#476) */
   seq?: number;
   /** Async validation status for this event (#475) */
@@ -287,4 +289,45 @@ export interface DocumentAnchor {
   hash: string;
   anchoredBy: string;
   anchoredAt: number;
+}
+
+// ── Archival types ────────────────────────────────────────────────────────────
+
+/** An archived tracking event — removed from the active timeline but retained for audit. */
+export interface ArchivedEvent {
+  event: TrackingEvent;
+  archivedBy: string;
+  archivedAt: number;
+  reason: string;
+}
+
+// ── Certification registry types ──────────────────────────────────────────────
+
+/** A trusted third-party certification issuer registered on-chain. */
+export interface CertificationIssuer {
+  issuerAddress: string;
+  name: string;
+  certTypes: string[];
+  registeredAt: number;
+  active: boolean;
+}
+
+/** A certification registry record linking a product to an external certificate. */
+export interface CertificationRegistryRecord {
+  id: string;
+  productId: string;
+  issuerAddress: string;
+  externalCertId: string;
+  certType: string;
+  documentHash: string;
+  issuedAt: number;
+  revoked: boolean;
+  revokedAt: number;
+}
+
+/** Result of verifying a certification registry record. */
+export interface CertificationVerificationResult {
+  valid: boolean;
+  record: CertificationRegistryRecord;
+  issuer?: CertificationIssuer;
 }
