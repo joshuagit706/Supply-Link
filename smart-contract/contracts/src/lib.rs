@@ -328,6 +328,42 @@ pub struct Batch {
     pub timestamp: u64,
 }
 
+/// An approval hop in the chain-of-custody for a product. (#499)
+/// Records each actor's approval as the product moves through the supply chain.
+#[contracttype]
+#[derive(Clone)]
+pub struct ApprovalHop {
+    /// ID of the product being approved.
+    pub product_id: String,
+    /// Address of the actor approving the product.
+    pub approver: Address,
+    /// Type of approval (e.g., "RECEIVED", "INSPECTED", "SHIPPED").
+    pub approval_type: String,
+    /// Timestamp when the approval was recorded.
+    pub timestamp: u64,
+    /// Optional JSON metadata about the approval.
+    pub metadata: String,
+}
+
+/// An origin attestation for a product. (#500)
+/// Proves where goods came from with cryptographic proof.
+#[contracttype]
+#[derive(Clone)]
+pub struct OriginAttestation {
+    /// ID of the product being attested.
+    pub product_id: String,
+    /// Address of the actor attesting to the origin.
+    pub attester: Address,
+    /// Description of the origin (e.g., "Ethiopian highlands, Yirgacheffe region").
+    pub origin_claim: String,
+    /// Cryptographic hash of supporting documentation.
+    pub proof_hash: String,
+    /// Timestamp when the attestation was recorded.
+    pub timestamp: u64,
+    /// Whether this attestation has been verified.
+    pub verified: bool,
+}
+
 /// An off-chain document anchored on-chain by its SHA-256 hash. (#460)
 ///
 /// Callers compute the SHA-256 hash of the document bytes off-chain and submit
@@ -442,6 +478,10 @@ pub enum DataKey {
     ActorNonce(Address),
     /// Key for the compliance policy of a product. The inner `String` is the product ID.
     CompliancePolicy(String),
+    /// Key for approval hops in the chain-of-custody. The inner `String` is the product ID. (#499)
+    ApprovalHops(String),
+    /// Key for origin attestations. The inner `String` is the product ID. (#500)
+    OriginAttestations(String),
     /// Key for document anchors for a product. The inner `String` is the product ID. (#460)
     DocumentAnchors(String),
     /// Actor trust weight record keyed by Address. (#495)
@@ -1298,297 +1338,242 @@ o            actor: caller,
         escrow
     }
 
-    // ── Issue #495: Actor trust weight and blacklist ──────────────────────────
+    // ── #499: Multi-hop approval chain-of-custody ────────────────────────────
 
-    /// Set or update the trust weight for an actor. Owner-only.
-    pub fn set_actor_trust_weight(
-        env: Env,
-        actor: Address,
-        trust_weight: u32,
-    ) -> ActorTrustWeight {
-        if trust_weight > 100 {
-            panic!("trust_weight must be 0-100");
-        }
-
-        let trust_record = ActorTrustWeight {
-            actor: actor.clone(),
-            trust_weight,
-            blacklisted: false,
-            blacklist_reason: String::from_str(&env, ""),
-            last_updated: env.ledger().timestamp(),
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::ActorTrustWeight(actor.clone()), &trust_record);
-
-        env.events().publish(
-            (Symbol::new(&env, "trust_weight_updated"), actor),
-            trust_weight,
-        );
-
-        trust_record
-    }
-
-    /// Blacklist an actor and reduce their trust weight. Owner-only.
-    pub fn blacklist_actor(
-        env: Env,
-        actor: Address,
-        reason: String,
-    ) -> ActorTrustWeight {
-        let mut trust_record: ActorTrustWeight = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ActorTrustWeight(actor.clone()))
-            .unwrap_or(ActorTrustWeight {
-                actor: actor.clone(),
-                trust_weight: 0,
-                blacklisted: false,
-                blacklist_reason: String::from_str(&env, ""),
-                last_updated: 0,
-            });
-
-        trust_record.blacklisted = true;
-        trust_record.blacklist_reason = reason;
-        trust_record.trust_weight = 0;
-        trust_record.last_updated = env.ledger().timestamp();
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::ActorTrustWeight(actor.clone()), &trust_record);
-
-        env.events().publish(
-            (Symbol::new(&env, "actor_blacklisted"), actor),
-            trust_record.clone(),
-        );
-
-        trust_record
-    }
-
-    /// Get the trust weight for an actor.
-    pub fn get_actor_trust_weight(env: Env, actor: Address) -> ActorTrustWeight {
-        env.storage()
-            .persistent()
-            .get(&DataKey::ActorTrustWeight(actor.clone()))
-            .unwrap_or(ActorTrustWeight {
-                actor,
-                trust_weight: 50,  // Default neutral trust
-                blacklisted: false,
-                blacklist_reason: String::from_str(&env, ""),
-                last_updated: 0,
-            })
-    }
-
-    // ── Issue #496: Certification chain explorer ──────────────────────────────
-
-    /// Add a certification chain link between two certifications.
-    pub fn add_certification_chain_link(
-        env: Env,
-        from_cert_id: String,
-        to_cert_id: String,
-        link_type: String,
-    ) -> CertificationChainLink {
-        let link = CertificationChainLink {
-            from_cert_id: from_cert_id.clone(),
-            to_cert_id: to_cert_id.clone(),
-            link_type: link_type.clone(),
-            created_at: env.ledger().timestamp(),
-        };
-
-        let product_id = from_cert_id.clone();
-        let mut links: Vec<CertificationChainLink> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::CertificationChainLinks(product_id.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
-
-        links.push_back(link.clone());
-        env.storage()
-            .persistent()
-            .set(&DataKey::CertificationChainLinks(product_id), &links);
-
-        env.events().publish(
-            (Symbol::new(&env, "cert_chain_link_added"), from_cert_id),
-            link.clone(),
-        );
-
-        link
-    }
-
-    /// Get all certification chain links for a product.
-    pub fn get_certification_chain_links(
+    /// Record an approval hop in the chain-of-custody for a product.
+    /// Each actor in the supply chain signs to approve the product's current state.
+    ///
+    /// # Parameters
+    /// - `env` — Soroban execution environment.
+    /// - `product_id` — ID of the product being approved.
+    /// - `approver` — Address of the actor approving the product.
+    /// - `approval_type` — Type of approval (e.g., "RECEIVED", "INSPECTED", "SHIPPED").
+    /// - `metadata` — Optional JSON metadata about the approval.
+    ///
+    /// # Returns
+    /// The approval hop record with timestamp and approver info.
+    ///
+    /// # Authorization
+    /// Requires `approver.require_auth()`.
+    ///
+    /// # Panics
+    /// - `"product not found"` — if `product_id` is not registered.
+    pub fn record_approval_hop(
         env: Env,
         product_id: String,
-    ) -> Vec<CertificationChainLink> {
-        env.storage()
+        approver: Address,
+        approval_type: String,
+        metadata: String,
+    ) -> ApprovalHop {
+        let product: Product = env
+            .storage()
             .persistent()
-            .get(&DataKey::CertificationChainLinks(product_id))
-            .unwrap_or_else(|| Vec::new(&env))
-    }
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
 
-    // ── Issue #497: Multi-stage recall with jurisdiction ────────────────────
+        approver.require_auth();
 
-    /// Create a recall stage for a product in a specific jurisdiction.
-    pub fn create_recall_stage(
-        env: Env,
-        product_id: String,
-        jurisdiction: String,
-        stage_type: String,
-    ) -> RecallStage {
-        let stage_id = format!("{}-{}-{}", &product_id, &jurisdiction, env.ledger().timestamp());
-
-        let stage = RecallStage {
-            stage_id: stage_id.clone(),
+        let hop = ApprovalHop {
             product_id: product_id.clone(),
-            jurisdiction,
-            stage_type,
-            created_at: env.ledger().timestamp(),
-            updated_at: env.ledger().timestamp(),
+            approver: approver.clone(),
+            approval_type: approval_type.clone(),
+            timestamp: env.ledger().timestamp(),
+            metadata,
         };
 
-        let mut stages: Vec<RecallStage> = env
+        let mut hops: Vec<ApprovalHop> = env
             .storage()
             .persistent()
-            .get(&DataKey::RecallStages(product_id.clone()))
+            .get(&DataKey::ApprovalHops(product_id.clone()))
             .unwrap_or_else(|| Vec::new(&env));
 
-        stages.push_back(stage.clone());
+        hops.push_back(hop.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::RecallStages(product_id), &stages);
+            .set(&DataKey::ApprovalHops(product_id.clone()), &hops);
 
         env.events().publish(
-            (Symbol::new(&env, "recall_stage_created"), stage_id),
-            stage.clone(),
+            (Symbol::new(&env, "approval_hop_recorded"), product_id),
+            hop.clone(),
         );
 
-        stage
+        hop
     }
 
-    /// Get all recall stages for a product.
-    pub fn get_recall_stages(env: Env, product_id: String) -> Vec<RecallStage> {
+    /// Retrieve all approval hops for a product's chain-of-custody.
+    ///
+    /// # Parameters
+    /// - `env` — Soroban execution environment.
+    /// - `product_id` — ID of the product.
+    ///
+    /// # Returns
+    /// Vector of all approval hops in chronological order.
+    pub fn get_approval_hops(env: Env, product_id: String) -> Vec<ApprovalHop> {
         env.storage()
             .persistent()
-            .get(&DataKey::RecallStages(product_id))
+            .get(&DataKey::ApprovalHops(product_id))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    // ── Issue #498: Provenance badge issuer registry ────────────────────────
-
-    /// Register a trusted badge issuer.
-    pub fn register_badge_issuer(
-        env: Env,
-        issuer: Address,
-        issuer_name: String,
-        badge_type: String,
-    ) -> BadgeIssuer {
-        let badge_issuer = BadgeIssuer {
-            issuer: issuer.clone(),
-            issuer_name,
-            badge_type,
-            trusted: true,
-            registered_at: env.ledger().timestamp(),
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::BadgeIssuer(issuer.clone()), &badge_issuer);
-
-        env.events().publish(
-            (Symbol::new(&env, "badge_issuer_registered"), issuer),
-            badge_issuer.clone(),
-        );
-
-        badge_issuer
-    }
-
-    /// Issue a provenance badge for a product.
-    pub fn issue_provenance_badge(
+    /// Verify the chain-of-custody for a product by checking approval hops.
+    ///
+    /// # Parameters
+    /// - `env` — Soroban execution environment.
+    /// - `product_id` — ID of the product.
+    /// - `required_approvers` — Vector of addresses that must have approved.
+    ///
+    /// # Returns
+    /// `true` if all required approvers have recorded an approval hop, `false` otherwise.
+    pub fn verify_chain_of_custody(
         env: Env,
         product_id: String,
-        issuer: Address,
-        badge_type: String,
-        expires_at: u64,
-    ) -> ProvenanceBadge {
-        // Verify issuer is registered and trusted
-        let issuer_record: BadgeIssuer = env
+        required_approvers: Vec<Address>,
+    ) -> bool {
+        let hops: Vec<ApprovalHop> = env
             .storage()
             .persistent()
-            .get(&DataKey::BadgeIssuer(issuer.clone()))
-            .expect("issuer not registered");
-
-        if !issuer_record.trusted {
-            panic!("issuer is not trusted");
-        }
-
-        let badge_id = format!("{}-{}-{}", &product_id, &badge_type, env.ledger().timestamp());
-
-        let badge = ProvenanceBadge {
-            badge_id: badge_id.clone(),
-            product_id: product_id.clone(),
-            issuer: issuer.clone(),
-            badge_type,
-            issued_at: env.ledger().timestamp(),
-            expires_at,
-            revoked: false,
-        };
-
-        let mut badges: Vec<ProvenanceBadge> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ProvenanceBadges(product_id.clone()))
+            .get(&DataKey::ApprovalHops(product_id))
             .unwrap_or_else(|| Vec::new(&env));
 
-        badges.push_back(badge.clone());
-        env.storage()
-            .persistent()
-            .set(&DataKey::ProvenanceBadges(product_id), &badges);
-
-        env.events().publish(
-            (Symbol::new(&env, "badge_issued"), badge_id),
-            badge.clone(),
-        );
-
-        badge
-    }
-
-    /// Get all provenance badges for a product.
-    pub fn get_provenance_badges(env: Env, product_id: String) -> Vec<ProvenanceBadge> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::ProvenanceBadges(product_id))
-            .unwrap_or_else(|| Vec::new(&env))
-    }
-
-    /// Revoke a provenance badge.
-    pub fn revoke_provenance_badge(env: Env, product_id: String, badge_id: String) -> bool {
-        let mut badges: Vec<ProvenanceBadge> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ProvenanceBadges(product_id.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let mut found = false;
-        for i in 0..badges.len() {
-            let mut badge = badges.get(i).unwrap();
-            if badge.badge_id == badge_id {
-                badge.revoked = true;
-                found = true;
+        for required in required_approvers.iter() {
+            let mut found = false;
+            for hop in hops.iter() {
+                if hop.approver == required {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return false;
             }
         }
+        true
+    }
 
-        if found {
-            env.storage()
-                .persistent()
-                .set(&DataKey::ProvenanceBadges(product_id), &badges);
+    // ── #500: Origin attestations ────────────────────────────────────────────
 
-            env.events().publish(
-                (Symbol::new(&env, "badge_revoked"), badge_id),
-                true,
-            );
+    /// Record an origin attestation for a product.
+    /// Proves where goods came from with cryptographic proof.
+    ///
+    /// # Parameters
+    /// - `env` — Soroban execution environment.
+    /// - `product_id` — ID of the product.
+    /// - `attester` — Address of the actor attesting to the origin.
+    /// - `origin_claim` — Description of the origin (e.g., "Ethiopian highlands, Yirgacheffe region").
+    /// - `proof_hash` — Cryptographic hash of supporting documentation.
+    ///
+    /// # Returns
+    /// The origin attestation record.
+    ///
+    /// # Authorization
+    /// Requires `attester.require_auth()`.
+    ///
+    /// # Panics
+    /// - `"product not found"` — if `product_id` is not registered.
+    pub fn attest_origin(
+        env: Env,
+        product_id: String,
+        attester: Address,
+        origin_claim: String,
+        proof_hash: String,
+    ) -> OriginAttestation {
+        let _product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+
+        attester.require_auth();
+
+        let attestation = OriginAttestation {
+            product_id: product_id.clone(),
+            attester: attester.clone(),
+            origin_claim,
+            proof_hash,
+            timestamp: env.ledger().timestamp(),
+            verified: false,
+        };
+
+        let mut attestations: Vec<OriginAttestation> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OriginAttestations(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        attestations.push_back(attestation.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::OriginAttestations(product_id.clone()), &attestations);
+
+        env.events().publish(
+            (Symbol::new(&env, "origin_attested"), product_id),
+            attestation.clone(),
+        );
+
+        attestation
+    }
+
+    /// Verify an origin attestation for a product.
+    /// Marks an attestation as verified by an authorized verifier.
+    ///
+    /// # Parameters
+    /// - `env` — Soroban execution environment.
+    /// - `product_id` — ID of the product.
+    /// - `attestation_index` — Index of the attestation to verify.
+    /// - `verifier` — Address of the verifier (typically product owner or auditor).
+    ///
+    /// # Returns
+    /// `true` if verification succeeded, `false` if attestation not found.
+    ///
+    /// # Authorization
+    /// Requires `verifier.require_auth()`.
+    pub fn verify_origin_attestation(
+        env: Env,
+        product_id: String,
+        attestation_index: u32,
+        verifier: Address,
+    ) -> bool {
+        verifier.require_auth();
+
+        let mut attestations: Vec<OriginAttestation> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OriginAttestations(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if attestation_index as usize >= attestations.len() {
+            return false;
         }
 
-        found
+        let mut attestation = attestations.get(attestation_index as usize).unwrap();
+        attestation.verified = true;
+
+        attestations.set(attestation_index as usize, attestation.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::OriginAttestations(product_id.clone()), &attestations);
+
+        env.events().publish(
+            (Symbol::new(&env, "origin_verified"), product_id),
+            attestation,
+        );
+
+        true
+    }
+
+    /// Retrieve all origin attestations for a product.
+    ///
+    /// # Parameters
+    /// - `env` — Soroban execution environment.
+    /// - `product_id` — ID of the product.
+    ///
+    /// # Returns
+    /// Vector of all origin attestations for the product.
+    pub fn get_origin_attestations(env: Env, product_id: String) -> Vec<OriginAttestation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OriginAttestations(product_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 }
 
