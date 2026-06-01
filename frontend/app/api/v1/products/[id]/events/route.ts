@@ -118,6 +118,17 @@ async function addEvent(
   // TODO: Persist to database instead of mock
   MOCK_EVENTS.push(newEvent);
 
+  // Notify webhooks of the new tracking event
+  try {
+    const { notifyWebhooksOfProductEvent } = await import('@/lib/webhooks/processor');
+    await notifyWebhooksOfProductEvent('event_added', productId, {
+      event: newEvent,
+    });
+  } catch (err) {
+    console.error('Failed to notify webhooks of event:', err);
+    // Don't fail the request if webhook notification fails
+  }
+
   return withCors(req, withCorrelationId(req, NextResponse.json(newEvent, { status: 201 })));
 }
 
