@@ -37,6 +37,7 @@ pub const EVENT_SCHEMA_VERSION: u32 = 2;
 mod tests;
 mod resilience_tests;
 mod compliance_tests;
+mod document_hash_tests;
 
 // ── Payload size limits (issue #311) ─────────────────────────────────────────
 // All limits are in bytes (Soroban String::len() returns byte count).
@@ -128,6 +129,9 @@ pub struct Product {
     pub recall_timestamp: u64,
     /// Schema version of this record (#392).
     pub schema_version: u32,
+    /// Hazard status (#454)
+    pub hazardous: bool,
+    pub hazard_classification: String,
 }
 
 #[contracttype]
@@ -360,6 +364,27 @@ pub struct OriginAttestation {
     pub verified: bool,
 }
 
+/// An off-chain document anchored on-chain by its SHA-256 hash. (#460)
+///
+/// Callers compute the SHA-256 hash of the document bytes off-chain and submit
+/// it here. The contract stores the hash alongside a human-readable label and
+/// the anchoring actor's address. Anyone can later call `verify_document_hash`
+/// to check whether a given hash matches the stored anchor.
+#[contracttype]
+#[derive(Clone)]
+pub struct DocumentAnchor {
+    /// Product this document belongs to.
+    pub product_id: String,
+    /// Human-readable label for the document (e.g. `"Certificate of Origin"`).
+    pub label: String,
+    /// Hex-encoded SHA-256 hash of the document bytes (64 chars).
+    pub hash: String,
+    /// Stellar address of the actor who anchored the document.
+    pub anchored_by: Address,
+    /// Ledger timestamp when the anchor was recorded.
+    pub anchored_at: u64,
+}
+
 // ── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -392,6 +417,8 @@ pub enum DataKey {
     ApprovalHops(String),
     /// Key for origin attestations. The inner `String` is the product ID. (#500)
     OriginAttestations(String),
+    /// Key for document anchors for a product. The inner `String` is the product ID. (#460)
+    DocumentAnchors(String),
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -484,6 +511,8 @@ impl SupplyLinkContract {
             active: true,
             category,
             subcategory,
+            hazardous: false,
+            hazard_classification: String::from_str(&env, ""),
         };
         env.storage()
             .persistent()
@@ -545,6 +574,8 @@ impl SupplyLinkContract {
                 recall_reason: String::from_str(&env, ""),
                 recall_timestamp: 0,
                 schema_version: SCHEMA_VERSION,
+                hazardous: false,
+                hazard_classification: String::from_str(&env, ""),
             };
             env.storage()
                 .persistent()
@@ -854,6 +885,26 @@ o            actor: caller,
             (Symbol::new(&env, "product_recalled"), product_id),
             product.recalled,
         );
+
+        true
+    }
+
+    /// Set hazard classification for a product (#454)
+    pub fn set_hazard_status(env: Env, product_id: String, hazardous: bool, classification: String) -> bool {
+        let mut product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+
+        product.owner.require_auth();
+
+        product.hazardous = hazardous;
+        product.hazard_classification = classification;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Product(product_id), &product);
 
         true
     }
@@ -2944,69 +2995,10 @@ fn compute_stable_id(
         hex_bytes[i * 2] = hex_chars[(byte >> 4) as usize];
         hex_bytes[i * 2 + 1] = hex_chars[(byte & 0xf) as usize];
     }
+
+    // Return the hex string representing the SHA-256 digest.
     String::from_bytes(env, &hex_bytes)
-            .ok_or(Error::ProductNotFound)?;
-
-        if product.owner != rejector {
-            return Err(Error::OwnerOnly);
-        }
-        rejector.require_auth();
-        Self::validate_and_increment_nonce(&env, &rejector, nonce);
-
-        // Validate reason length (max 256 characters)
-        if reason.len() > 256 {
-            panic!("rejection reason too long");
-        }
-
-        let mut pending: Vec<PendingEvent> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PendingEvents(product_id.clone()))
-            .ok_or(Error::NoPendingEvents)?;
-
-        // Find the pending event by stable ID (not index-based)
-        let mut event_position: Option<usize> = None;
-        for i in 0..pending.len() {
-            if pending.get(i).unwrap().pending_event_id == pending_event_id {
-                event_position = Some(i);
-                break;
-            }
-        }
-
-        let event_index = event_position.ok_or_else(|| {
-            panic!("pending event not found")
-        })?;
-
-        let rejected_event = pending.get(event_index).unwrap().clone();
-
-        // Remove from pending
-        pending.remove(event_index);
-        if pending.len() > 0 {
-            env.storage()
-                .persistent()
-                .set(&DataKey::PendingEvents(product_id.clone()), &pending);
-        } else {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::PendingEvents(product_id.clone()));
-        }
-
-        // Emit enriched rejection event with reason
-        let rejection = EventRejection {
-            product_id: product_id.clone(),
-            event: rejected_event.event,
-            rejector,
-            reason,
-            timestamp: env.ledger().timestamp(),
-        };
-
-        env.events().publish(
-            (Symbol::new(&env, "event_rejected"), product_id),
-            rejection,
-        );
-
-        Ok(true)
-    }
+}
 
     /// Property 4: Count equals vec length
     proptest! {
@@ -3883,6 +3875,106 @@ mod rejection_reason_tests {
             .get(&DataKey::Batch(id))
             .expect("batch not found")
     }
-}
 
-mod tests;
+    // ── #460: Document hash anchoring ─────────────────────────────────────────
+
+    /// Anchor an off-chain document hash on-chain for a product.
+    ///
+    /// The caller computes the SHA-256 hash of the document bytes off-chain
+    /// and submits the hex-encoded digest here. The contract stores it
+    /// immutably so it can be verified later via [`Self::verify_document_hash`].
+    ///
+    /// # Parameters
+    /// - `product_id` — ID of the product this document belongs to.
+    /// - `label` — Human-readable document label (max 256 bytes).
+    /// - `hash` — Hex-encoded SHA-256 digest of the document (64 chars).
+    /// - `caller` — Address anchoring the document; must be owner or authorized actor.
+    ///
+    /// # Returns
+    /// The newly created [`DocumentAnchor`].
+    ///
+    /// # Authorization
+    /// Requires `caller.require_auth()`.
+    pub fn anchor_document_hash(
+        env: Env,
+        product_id: String,
+        label: String,
+        hash: String,
+        caller: Address,
+    ) -> DocumentAnchor {
+        let product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+
+        let is_owner = product.owner == caller;
+        let is_actor = product.authorized_actors.contains(&caller);
+        if !is_owner && !is_actor {
+            panic!("caller is not authorized");
+        }
+        caller.require_auth();
+
+        assert_len(&label, MAX_NAME_LEN, "label");
+        // SHA-256 hex digest is exactly 64 chars
+        if hash.len() != 64 {
+            panic!("hash must be a 64-char hex-encoded SHA-256 digest");
+        }
+
+        let anchor = DocumentAnchor {
+            product_id: product_id.clone(),
+            label,
+            hash,
+            anchored_by: caller,
+            anchored_at: env.ledger().timestamp(),
+        };
+
+        let mut anchors: Vec<DocumentAnchor> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DocumentAnchors(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        anchors.push_back(anchor.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::DocumentAnchors(product_id.clone()), &anchors);
+
+        env.events().publish(
+            (Symbol::new(&env, "document_anchored"), product_id),
+            anchor.clone(),
+        );
+
+        anchor
+    }
+
+    /// Verify whether a given hash matches any anchored document for a product.
+    ///
+    /// # Parameters
+    /// - `product_id` — ID of the product to check.
+    /// - `hash` — Hex-encoded SHA-256 digest to look up.
+    ///
+    /// # Returns
+    /// `true` if the hash matches an existing anchor; `false` otherwise.
+    pub fn verify_document_hash(env: Env, product_id: String, hash: String) -> bool {
+        let anchors: Vec<DocumentAnchor> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DocumentAnchors(product_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        for i in 0..anchors.len() {
+            if anchors.get(i).unwrap().hash == hash {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Return all document anchors for a product.
+    pub fn get_document_anchors(env: Env, product_id: String) -> Vec<DocumentAnchor> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DocumentAnchors(product_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+}

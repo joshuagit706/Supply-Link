@@ -627,3 +627,34 @@ fn test_nonce_isolated_per_actor() {
     assert_eq!(client.get_nonce(&owner1), 1);
     assert_eq!(client.get_nonce(&owner2), 1);
 }
+
+#[test]
+fn test_set_hazard_status() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let contract_id = env.register_contract(None, SupplyLinkContract);
+    let client = SupplyLinkContractClient::new(&env, &contract_id);
+    
+    let owner = Address::generate(&env);
+    
+    client.register_product(
+        &String::from_str(&env, "haz1"),
+        &String::from_str(&env, "Chemical"),
+        &String::from_str(&env, "Factory"),
+        &owner,
+        &1,
+        &String::from_str(&env, "cat"),
+        &String::from_str(&env, "sub"),
+    );
+    
+    client.set_hazard_status(
+        &String::from_str(&env, "haz1"),
+        &true,
+        &String::from_str(&env, "Flammable"),
+    );
+    
+    let product = client.get_product(&String::from_str(&env, "haz1"));
+    assert_eq!(product.hazardous, true);
+    assert_eq!(product.hazard_classification, String::from_str(&env, "Flammable"));
+}
