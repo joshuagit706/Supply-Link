@@ -1,35 +1,58 @@
-"use client";
+'use client';
 
-import { useEffect, useRef, useState } from "react";
-import QRCode from "qrcode";
+import { useEffect, useRef, useState } from 'react';
+import QRCode from 'qrcode';
+import { encodeQrProof, type QrProofPayload } from '@/lib/services/offlineVerify';
 
 interface ProductQRCodeProps {
   productId: string;
   size?: number;
+  /** Optional proof payload — when provided the QR embeds a signed offline proof. */
+  proof?: QrProofPayload;
 }
 
-export default function ProductQRCode({ productId, size = 200 }: ProductQRCodeProps) {
+export default function ProductQRCode({ productId, size = 200, proof }: ProductQRCodeProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [url, setUrl] = useState("");
+  const [url, setUrl] = useState('');
 
   useEffect(() => {
-    const verifyUrl = `${window.location.origin}/verify/${productId}`;
-    setUrl(verifyUrl);
-    if (canvasRef.current) {
-      QRCode.toCanvas(canvasRef.current, verifyUrl, {
-        width: size,
-        margin: 2,
-        color: { dark: "#000000", light: "#ffffff" },
-      });
-    }
-  }, [productId, size]);
+    let cancelled = false;
+
+    (async () => {
+      const base = `${window.location.origin}/verify/${productId}`;
+      let verifyUrl = base;
+
+      if (proof) {
+        try {
+          const token = await encodeQrProof(proof);
+          verifyUrl = `${base}?proof=${token}`;
+        } catch {
+          // Fall back to plain URL if signing fails
+        }
+      }
+
+      if (cancelled) return;
+      setUrl(verifyUrl);
+      if (canvasRef.current) {
+        QRCode.toCanvas(canvasRef.current, verifyUrl, {
+          width: size,
+          margin: 2,
+          color: { dark: '#000000', light: '#ffffff' },
+        });
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [productId, size, proof]);
 
   const handleDownload = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const link = document.createElement("a");
+    const link = document.createElement('a');
     link.download = `qr-product-${productId}.png`;
-    link.href = canvas.toDataURL("image/png");
+    link.href = canvas.toDataURL('image/png');
     link.click();
   };
 

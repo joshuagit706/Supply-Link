@@ -11,6 +11,7 @@ import { ShareButton } from '@/components/ui/ShareButton';
 import { ProvenanceScoreGauge } from '@/components/products/ProvenanceScoreGauge';
 import ProductVerifyClient from './ProductVerifyClient';
 import { DocumentAnchorsPanel } from '@/components/products/DocumentAnchorsPanel';
+import type { QrProofPayload } from '@/lib/services/offlineVerify';
 
 interface Props {
   params: Promise<{ id: string; locale: string }>;
@@ -117,7 +118,19 @@ export default async function VerifyPage({ params }: Props) {
             {t('owner')}: {product.owner}
           </p>
         </div>
-        <ProductQRCode productId={product.id} size={140} />
+        <ProductQRCode
+          productId={product.id}
+          size={140}
+          proof={
+            {
+              id: product.id,
+              name: product.name,
+              origin: product.origin,
+              owner: product.owner,
+              ts: product.timestamp,
+            } satisfies QrProofPayload
+          }
+        />
       </div>
 
       {product.hazardous && (
