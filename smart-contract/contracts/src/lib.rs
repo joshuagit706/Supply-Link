@@ -385,6 +385,71 @@ pub struct DocumentAnchor {
     pub anchored_at: u64,
 }
 
+// ── Issue #495: Actor trust weight and blacklist ──────────────────────────────
+
+/// Trust weight record for an actor (manufacturer/supplier). (#495)
+#[contracttype]
+#[derive(Clone)]
+pub struct ActorTrustWeight {
+    pub actor: Address,
+    pub trust_weight: u32,  // 0-100 scale
+    pub blacklisted: bool,
+    pub blacklist_reason: String,
+    pub last_updated: u64,
+}
+
+// ── Issue #496: Certification chain explorer ──────────────────────────────────
+
+/// Certification chain link showing dependencies between certifications. (#496)
+#[contracttype]
+#[derive(Clone)]
+pub struct CertificationChainLink {
+    pub from_cert_id: String,
+    pub to_cert_id: String,
+    pub link_type: String,  // "depends_on", "supersedes", "related"
+    pub created_at: u64,
+}
+
+// ── Issue #497: Multi-stage recall with jurisdiction ────────────────────────
+
+/// Recall stage with jurisdiction scope. (#497)
+#[contracttype]
+#[derive(Clone)]
+pub struct RecallStage {
+    pub stage_id: String,
+    pub product_id: String,
+    pub jurisdiction: String,  // ISO 3166-1 alpha-2 code or "GLOBAL"
+    pub stage_type: String,    // "INITIATED", "IN_PROGRESS", "COMPLETED"
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+// ── Issue #498: Provenance badge issuer registry ────────────────────────────
+
+/// Registered badge issuer for provenance validation. (#498)
+#[contracttype]
+#[derive(Clone)]
+pub struct BadgeIssuer {
+    pub issuer: Address,
+    pub issuer_name: String,
+    pub badge_type: String,  // "ORGANIC", "FAIR_TRADE", "ISO_9001", etc.
+    pub trusted: bool,
+    pub registered_at: u64,
+}
+
+/// Provenance badge issued by a trusted validator. (#498)
+#[contracttype]
+#[derive(Clone)]
+pub struct ProvenanceBadge {
+    pub badge_id: String,
+    pub product_id: String,
+    pub issuer: Address,
+    pub badge_type: String,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub revoked: bool,
+}
+
 // ── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -419,6 +484,16 @@ pub enum DataKey {
     OriginAttestations(String),
     /// Key for document anchors for a product. The inner `String` is the product ID. (#460)
     DocumentAnchors(String),
+    /// Actor trust weight record keyed by Address. (#495)
+    ActorTrustWeight(Address),
+    /// Certification chain links for a product. (#496)
+    CertificationChainLinks(String),
+    /// Recall stages for a product. (#497)
+    RecallStages(String),
+    /// Badge issuer registry keyed by Address. (#498)
+    BadgeIssuer(Address),
+    /// Provenance badges for a product. (#498)
+    ProvenanceBadges(String),
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
