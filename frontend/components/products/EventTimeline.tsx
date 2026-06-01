@@ -1,3 +1,7 @@
+'use client';
+
+import { useState } from 'react';
+import { Archive } from 'lucide-react';
 import type { TrackingEvent, EventType } from '@/lib/types';
 import { PrivateMetadataViewer } from './PrivateMetadataViewer';
 
@@ -23,48 +27,110 @@ interface EventTimelineProps {
   emptyLabel?: string;
   /** BCP-47 locale used to format timestamps; falls back to runtime default. */
   locale?: string;
+  /**
+   * When true, archived events are hidden by default and a toggle is shown.
+   * Defaults to true — archived events are excluded from the active timeline.
+   */
+  hideArchivedByDefault?: boolean;
+  /** Called when the user requests to archive an event. */
+  onArchiveRequest?: (stableId: string) => void;
 }
 
-export function EventTimeline({ events, labels, emptyLabel, locale }: EventTimelineProps) {
+export function EventTimeline({
+  events,
+  labels,
+  emptyLabel,
+  locale,
+  hideArchivedByDefault = true,
+  onArchiveRequest,
+}: EventTimelineProps) {
+  const [showArchived, setShowArchived] = useState(false);
+
   const labelFor = (type: EventType) => labels?.[type] ?? DEFAULT_EVENT_LABELS[type];
   const dateFmt = new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeStyle: 'short' });
 
-  if (events.length === 0) {
-    return <p className="text-sm text-[var(--muted)]">{emptyLabel ?? 'No events recorded yet.'}</p>;
-  }
+  const activeEvents = hideArchivedByDefault && !showArchived
+    ? events.filter((e) => !e.archived)
+    : events;
+
+  const archivedCount = events.filter((e) => e.archived).length;
 
   return (
-    <ol className="relative border-l border-[var(--card-border)] ml-2 space-y-6">
-      {events.map((event, i) => (
-        <li key={i} className="ml-5">
-          <span
-            className={`absolute -left-2 mt-1 h-4 w-4 rounded-full border-2 border-[var(--background)] ${EVENT_COLORS[event.eventType]}`}
-          />
-          <div className="flex items-center gap-2 mb-1">
-            <span className="text-xs font-semibold uppercase tracking-wide text-[var(--foreground)]">
-              {labelFor(event.eventType)}
-            </span>
-            <span className="text-xs text-[var(--muted)]">
-              {dateFmt.format(new Date(event.timestamp))}
-            </span>
-          </div>
-          <p className="text-sm text-[var(--foreground)]">{event.location}</p>
-          <p className="text-xs text-[var(--muted)] font-mono mt-0.5 truncate">{event.actor}</p>
-          {event.privateMetadata && event.metadataCommitment ? (
-            <div className="mt-2">
-              {/* Public verification page: viewer is not authorized to decrypt. */}
-              <PrivateMetadataViewer commitment={event.metadataCommitment} authorized={false} />
-            </div>
-          ) : (
-            event.metadata &&
-            event.metadata !== '{}' && (
-              <pre className="mt-1 text-xs bg-[var(--muted-bg)] text-[var(--muted)] rounded-md px-3 py-2 overflow-x-auto">
-                {JSON.stringify(JSON.parse(event.metadata), null, 2)}
-              </pre>
-            )
-          )}
-        </li>
-      ))}
-    </ol>
+    <div>
+      {/* Archive toggle — only shown when there are archived events */}
+      {archivedCount > 0 && hideArchivedByDefault && (
+        <div className="flex items-center gap-2 mb-4">
+          <button
+            type="button"
+            onClick={() => setShowArchived((v) => !v)}
+            className="inline-flex items-center gap-1.5 text-xs text-[var(--muted)] hover:text-[var(--foreground)] transition-colors"
+          >
+            <Archive size={13} />
+            {showArchived
+              ? `Hide ${archivedCount} archived event${archivedCount !== 1 ? 's' : ''}`
+              : `Show ${archivedCount} archived event${archivedCount !== 1 ? 's' : ''}`}
+          </button>
+        </div>
+      )}
+
+      {activeEvents.length === 0 ? (
+        <p className="text-sm text-[var(--muted)]">{emptyLabel ?? 'No events recorded yet.'}</p>
+      ) : (
+        <ol className="relative border-l border-[var(--card-border)] ml-2 space-y-6">
+          {activeEvents.map((event, i) => (
+            <li
+              key={event.stableId ?? i}
+              className={`ml-5 ${event.archived ? 'opacity-50' : ''}`}
+            >
+              <span
+                className={`absolute -left-2 mt-1 h-4 w-4 rounded-full border-2 border-[var(--background)] ${EVENT_COLORS[event.eventType]}`}
+              />
+              <div className="flex items-center gap-2 mb-1">
+                <span className="text-xs font-semibold uppercase tracking-wide text-[var(--foreground)]">
+                  {labelFor(event.eventType)}
+                </span>
+                <span className="text-xs text-[var(--muted)]">
+                  {dateFmt.format(new Date(event.timestamp))}
+                </span>
+                {event.archived && (
+                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs bg-[var(--muted-bg)] text-[var(--muted)] border border-[var(--card-border)]">
+                    <Archive size={10} />
+                    Archived
+                  </span>
+                )}
+                {!event.archived && onArchiveRequest && event.stableId && (
+                  <button
+                    type="button"
+                    onClick={() => onArchiveRequest(event.stableId!)}
+                    className="ml-auto text-xs text-[var(--muted)] hover:text-[var(--foreground)] transition-colors"
+                    title="Archive this event"
+                  >
+                    <Archive size={12} />
+                  </button>
+                )}
+              </div>
+              <p className="text-sm text-[var(--foreground)]">{event.location}</p>
+              <p className="text-xs text-[var(--muted)] font-mono mt-0.5 truncate">{event.actor}</p>
+              {(event as TrackingEvent & { privateMetadata?: boolean; metadataCommitment?: string }).privateMetadata &&
+              (event as TrackingEvent & { metadataCommitment?: string }).metadataCommitment ? (
+                <div className="mt-2">
+                  <PrivateMetadataViewer
+                    commitment={(event as TrackingEvent & { metadataCommitment?: string }).metadataCommitment!}
+                    authorized={false}
+                  />
+                </div>
+              ) : (
+                event.metadata &&
+                event.metadata !== '{}' && (
+                  <pre className="mt-1 text-xs bg-[var(--muted-bg)] text-[var(--muted)] rounded-md px-3 py-2 overflow-x-auto">
+                    {JSON.stringify(JSON.parse(event.metadata), null, 2)}
+                  </pre>
+                )
+              )}
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
   );
 }

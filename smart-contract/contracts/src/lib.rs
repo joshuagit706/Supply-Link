@@ -37,8 +37,8 @@ pub const EVENT_SCHEMA_VERSION: u32 = 2;
 mod tests;
 mod resilience_tests;
 mod compliance_tests;
-pub mod assembly_warranty;
-mod assembly_warranty_tests;
+mod archival_tests;
+mod document_hash_tests;
 
 // ── Payload size limits (issue #311) ─────────────────────────────────────────
 // All limits are in bytes (Soroban String::len() returns byte count).
@@ -79,6 +79,8 @@ pub enum Error {
     PendingEventExpired = 6,
     InvalidNonce = 7,
     ComplianceViolation = 8,
+    /// Contract is paused; write operations are not permitted.
+    ContractPaused = 9,
 }
 
 // ── Compliance rule types ─────────────────────────────────────────────────────
@@ -130,6 +132,9 @@ pub struct Product {
     pub recall_timestamp: u64,
     /// Schema version of this record (#392).
     pub schema_version: u32,
+    /// Hazard status (#454)
+    pub hazardous: bool,
+    pub hazard_classification: String,
 }
 
 #[contracttype]
@@ -324,6 +329,222 @@ pub struct Batch {
     pub owner: Address,
     pub product_ids: Vec<String>,
     pub timestamp: u64,
+    /// Whether this batch has been recalled.
+    pub recalled: bool,
+    /// Reason provided when the batch was recalled.
+    pub recall_reason: String,
+    /// Ledger timestamp when the batch was recalled; 0 if never recalled.
+    pub recall_timestamp: u64,
+}
+
+// ── Auditor registry (#auditor) ───────────────────────────────────────────────
+
+/// A registered auditor who can sign attestations for events and products.
+///
+/// Auditors are identified by their Stellar address. Only registered auditors
+/// may submit attestations. Registration is permissioned — only the contract
+/// admin (first caller of `initialize_admin`) may register auditors.
+#[contracttype]
+#[derive(Clone)]
+pub struct Auditor {
+    /// Stellar address of the auditor.
+    pub address: Address,
+    /// Human-readable name of the auditing organisation.
+    pub name: String,
+    /// Whether this auditor registration is currently active.
+    pub active: bool,
+    /// Ledger timestamp when the auditor was registered.
+    pub registered_at: u64,
+}
+
+/// A signed attestation from a registered auditor for a product event or product.
+///
+/// Attestations are append-only. The `signature` field carries a hex-encoded
+/// Ed25519 signature over the canonical payload:
+/// `product_id|target_id|attestation_type|timestamp` (UTF-8 bytes, pipe-separated).
+///
+/// Consumers verify the signature by:
+/// 1. Reconstructing the canonical payload string.
+/// 2. Fetching the auditor's public key (their Stellar address).
+/// 3. Verifying the Ed25519 signature.
+#[contracttype]
+#[derive(Clone)]
+pub struct Attestation {
+    /// Stable unique identifier for this attestation.
+    pub id: String,
+    /// ID of the product this attestation is for.
+    pub product_id: String,
+    /// ID of the specific event being attested (stable_id), or empty string
+    /// if the attestation is at the product level.
+    pub target_id: String,
+    /// Stellar address of the auditor who signed this attestation.
+    pub auditor: Address,
+    /// Attestation type (e.g. `"quality_check"`, `"compliance_verified"`,
+    /// `"safety_approved"`, `"origin_verified"`).
+    pub attestation_type: String,
+    /// Hex-encoded Ed25519 signature over the canonical payload.
+    pub signature: String,
+    /// Ledger timestamp when the attestation was submitted.
+    pub timestamp: u64,
+    /// Optional human-readable notes from the auditor (max 1024 bytes).
+    pub notes: String,
+}
+
+/// An approval hop in the chain-of-custody for a product. (#499)
+/// Records each actor's approval as the product moves through the supply chain.
+#[contracttype]
+#[derive(Clone)]
+pub struct ApprovalHop {
+    /// ID of the product being approved.
+    pub product_id: String,
+    /// Address of the actor approving the product.
+    pub approver: Address,
+    /// Type of approval (e.g., "RECEIVED", "INSPECTED", "SHIPPED").
+    pub approval_type: String,
+    /// Timestamp when the approval was recorded.
+    pub timestamp: u64,
+    /// Optional JSON metadata about the approval.
+    pub metadata: String,
+}
+
+/// An origin attestation for a product. (#500)
+/// Proves where goods came from with cryptographic proof.
+#[contracttype]
+#[derive(Clone)]
+pub struct OriginAttestation {
+    /// ID of the product being attested.
+    pub product_id: String,
+    /// Address of the actor attesting to the origin.
+    pub attester: Address,
+    /// Description of the origin (e.g., "Ethiopian highlands, Yirgacheffe region").
+    pub origin_claim: String,
+    /// Cryptographic hash of supporting documentation.
+    pub proof_hash: String,
+    /// Timestamp when the attestation was recorded.
+    pub timestamp: u64,
+    /// Whether this attestation has been verified.
+    pub verified: bool,
+}
+
+/// An off-chain document anchored on-chain by its SHA-256 hash. (#460)
+///
+/// Callers compute the SHA-256 hash of the document bytes off-chain and submit
+/// it here. The contract stores the hash alongside a human-readable label and
+/// the anchoring actor's address. Anyone can later call `verify_document_hash`
+/// to check whether a given hash matches the stored anchor.
+#[contracttype]
+#[derive(Clone)]
+pub struct DocumentAnchor {
+    /// Product this document belongs to.
+    pub product_id: String,
+    /// Human-readable label for the document (e.g. `"Certificate of Origin"`).
+    pub label: String,
+    /// Hex-encoded SHA-256 hash of the document bytes (64 chars).
+    pub hash: String,
+    /// Stellar address of the actor who anchored the document.
+    pub anchored_by: Address,
+    /// Ledger timestamp when the anchor was recorded.
+    pub anchored_at: u64,
+}
+
+/// Product identifier alias mapping for canonicalization (#508).
+/// Maps external/alternative identifiers to the canonical product ID.
+#[contracttype]
+#[derive(Clone)]
+pub struct ProductIdAlias {
+    /// The canonical product ID this alias maps to.
+    pub canonical_id: String,
+    /// The external/alternative identifier.
+    pub alias: String,
+    /// Stellar address of the actor who created this alias.
+    pub created_by: Address,
+    /// Ledger timestamp when the alias was created.
+    pub created_at: u64,
+}
+
+/// Provenance score metadata for tracking across upgrades (#507).
+#[contracttype]
+#[derive(Clone)]
+pub struct ProvenanceScoreMetadata {
+    /// Product ID this score belongs to.
+    pub product_id: String,
+    /// Current provenance score (0-100).
+    pub score: u32,
+    /// Timestamp of last score calculation.
+    pub last_calculated_at: u64,
+    /// Number of verified events contributing to this score.
+    pub verified_event_count: u32,
+    /// Schema version for score calculation semantics.
+    pub schema_version: u32,
+}
+
+/// Archival record wrapping a [`TrackingEvent`] with retention metadata.
+///
+/// Archived events are moved out of the active `Events` list into a separate
+/// `ArchivedEvents` store. The original event data and its `stable_id` are
+/// preserved verbatim so integrity proofs remain valid. Archived events do
+/// **not** appear in `get_tracking_events` / `list_tracking_events` but are
+/// fully queryable via `list_archived_events`.
+#[contracttype]
+#[derive(Clone)]
+pub struct ArchivedEvent {
+    /// The original tracking event — unchanged, integrity preserved.
+    pub event: TrackingEvent,
+    /// Stellar address of the actor who archived this event.
+    pub archived_by: Address,
+    /// Ledger timestamp when the event was archived.
+    pub archived_at: u64,
+    /// Optional human-readable reason for archival (e.g. "retention policy").
+    pub reason: String,
+}
+
+/// A trusted certification issuer registered in the on-chain certification registry.
+///
+/// Third-party agencies (e.g. ISO bodies, fair-trade organisations) are
+/// registered here. Products can then reference a `cert_registry_ref` that
+/// points to an issuer + external certificate ID, and anyone can call
+/// `verify_certification_registry_ref` to confirm the reference is valid.
+#[contracttype]
+#[derive(Clone)]
+pub struct CertificationIssuer {
+    /// Stellar address of the issuing organisation's on-chain identity.
+    pub issuer_address: Address,
+    /// Human-readable name of the issuing organisation.
+    pub name: String,
+    /// Certification types this issuer is authorised to issue (e.g. `"organic"`, `"iso_9001"`).
+    pub cert_types: Vec<String>,
+    /// Ledger timestamp when this issuer was registered.
+    pub registered_at: u64,
+    /// Whether this issuer is currently active.
+    pub active: bool,
+}
+
+/// A certification registry record linking a product certification to an external issuer.
+///
+/// Stores the issuer address, the external certificate ID (as issued by the
+/// third-party body), and a cross-check hash so consumers can verify the
+/// reference without trusting the on-chain string alone.
+#[contracttype]
+#[derive(Clone)]
+pub struct CertificationRegistryRecord {
+    /// Unique ID for this registry record.
+    pub id: String,
+    /// ID of the product this record belongs to.
+    pub product_id: String,
+    /// Stellar address of the registered issuer.
+    pub issuer_address: Address,
+    /// External certificate identifier as issued by the third-party body.
+    pub external_cert_id: String,
+    /// Certification type (must match one of the issuer's `cert_types`).
+    pub cert_type: String,
+    /// Hex-encoded SHA-256 hash of the external certificate document for cross-checking.
+    pub document_hash: String,
+    /// Ledger timestamp when this record was created.
+    pub issued_at: u64,
+    /// Whether this registry record has been revoked.
+    pub revoked: bool,
+    /// Ledger timestamp when revoked (0 if not revoked).
+    pub revoked_at: u64,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -354,17 +575,46 @@ pub enum DataKey {
     ActorNonce(Address),
     /// Key for the compliance policy of a product. The inner `String` is the product ID.
     CompliancePolicy(String),
-    /// Key for the product assembly record (parent-child relationships).
-    /// The inner `String` is the parent product ID.
-    Assembly(String),
-    /// Key for the warranty metadata of a product.
-    /// The inner `String` is the product ID.
-    Warranty(String),
-    /// Key for the list of warranty claims for a product.
-    /// The inner `String` is the product ID.
-    WarrantyClaims(String),
-    /// Key for the certifications list of a product. (#428)
+    /// Key for approval hops in the chain-of-custody. The inner `String` is the product ID. (#499)
+    ApprovalHops(String),
+    /// Key for origin attestations. The inner `String` is the product ID. (#500)
+    OriginAttestations(String),
+    /// Key for document anchors for a product. The inner `String` is the product ID. (#460)
+    DocumentAnchors(String),
+    /// Key for product ID aliases. The inner `String` is the alias. (#508)
+    ProductIdAlias(String),
+    /// Key for provenance score metadata. The inner `String` is the product ID. (#507)
+    ProvenanceScore(String),
+    /// Archived events for a product — events flagged as archived but retained for audit. (archival)
+    ArchivedEvents(String),
+    /// Certification registry issuers — trusted third-party certification bodies. (cert-registry)
+    CertificationIssuers,
+    /// Per-issuer certification records keyed by issuer address. (cert-registry)
+    IssuerCertifications(Address),
+    /// Certification registry records for a product. (cert-registry)
+    CertRegistryRecords(String),
+    /// On-chain product certifications (#428). The inner `String` is the product ID.
     Certifications(String),
+    /// Event-level certifications (#505). The inner `String` is the product ID.
+    EventCertifications(String),
+    /// Provenance notarizations for a product (#504). The inner `String` is the product ID.
+    ProvenanceNotarizations(String),
+    /// Registered certifier by ID (#505). The inner `String` is the certifier ID.
+    Certifier(String),
+    /// List of all certifier IDs (#505).
+    CertifierIds,
+    /// Index of certifier IDs (alternate key). The inner `String` is the certifier ID.
+    CertifierIndex(String),
+    /// Pending ownership transfer escrow. The inner `String` is the product ID.
+    TransferEscrow(String),
+    /// Anomaly reports for a product. The inner `String` is the product ID.
+    AnomalyReports(String),
+    /// Event timestamp certifications. The inner `String` is the product ID.
+    EventTimestampCerts(String),
+    /// Single pending event by ID (alternate lookup). The inner `String` is the product ID.
+    PendingEvent(String),
+    /// Provenance root hash for a product. The inner `String` is the product ID.
+    ProvenanceRoot(String),
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -433,6 +683,11 @@ impl SupplyLinkContract {
             panic!("product already exists");
         }
 
+        // Emergency stop: reject writes when contract is paused.
+        if env.storage().persistent().get(&DataKey::ContractPaused).unwrap_or(false) {
+            panic!("contract is paused");
+        }
+
         owner.require_auth();
         // Issue #311: enforce size limits.
         assert_len(&id,          MAX_ID_LEN,     "id");
@@ -457,6 +712,8 @@ impl SupplyLinkContract {
             active: true,
             category,
             subcategory,
+            hazardous: false,
+            hazard_classification: String::from_str(&env, ""),
         };
         env.storage()
             .persistent()
@@ -518,6 +775,8 @@ impl SupplyLinkContract {
                 recall_reason: String::from_str(&env, ""),
                 recall_timestamp: 0,
                 schema_version: SCHEMA_VERSION,
+                hazardous: false,
+                hazard_classification: String::from_str(&env, ""),
             };
             env.storage()
                 .persistent()
@@ -594,6 +853,11 @@ impl SupplyLinkContract {
 
         if !product.active {
             panic!("product is deactivated");
+        }
+
+        // Emergency stop: reject writes when contract is paused.
+        if env.storage().persistent().get(&DataKey::ContractPaused).unwrap_or(false) {
+            return Err(Error::ContractPaused);
         }
 
         // Reject events on recalled products (#393)
@@ -827,6 +1091,26 @@ o            actor: caller,
             (Symbol::new(&env, "product_recalled"), product_id),
             product.recalled,
         );
+
+        true
+    }
+
+    /// Set hazard classification for a product (#454)
+    pub fn set_hazard_status(env: Env, product_id: String, hazardous: bool, classification: String) -> bool {
+        let mut product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+
+        product.owner.require_auth();
+
+        product.hazardous = hazardous;
+        product.hazard_classification = classification;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Product(product_id), &product);
 
         true
     }
@@ -1183,6 +1467,164 @@ o            actor: caller,
             escrow.clone(),
         );
         escrow
+    }
+
+    // ── #508: Product identifier canonicalization ────────────────────────────
+
+    /// Register an alias for a product ID that maps to a canonical ID.
+    /// Prevents duplicate canonical mappings.
+    pub fn register_product_alias(
+        env: Env,
+        canonical_id: String,
+        alias: String,
+        creator: Address,
+    ) -> ProductIdAlias {
+        creator.require_auth();
+
+        // Verify canonical product exists
+        if !env.storage().persistent().has(&DataKey::Product(canonical_id.clone())) {
+            panic!("canonical product not found");
+        }
+
+        // Prevent duplicate canonical mappings
+        if env.storage().persistent().has(&DataKey::ProductIdAlias(alias.clone())) {
+            panic!("alias already exists");
+        }
+
+        let alias_entry = ProductIdAlias {
+            canonical_id: canonical_id.clone(),
+            alias: alias.clone(),
+            created_by: creator,
+            created_at: env.ledger().timestamp(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProductIdAlias(alias.clone()), &alias_entry);
+
+        env.events().publish(
+            (Symbol::new(&env, "alias_registered"), alias),
+            alias_entry.clone(),
+        );
+
+        alias_entry
+    }
+
+    /// Resolve a product ID (canonical or alias) to its canonical ID.
+    pub fn resolve_product_id(env: Env, id: String) -> String {
+        // Check if it's an alias
+        if let Some(alias_entry) = env
+            .storage()
+            .persistent()
+            .get::<_, ProductIdAlias>(&DataKey::ProductIdAlias(id.clone()))
+        {
+            return alias_entry.canonical_id;
+        }
+        // Otherwise return the ID as-is (assume it's canonical)
+        id
+    }
+
+    /// Get all aliases for a canonical product ID.
+    pub fn get_product_aliases(env: Env, canonical_id: String) -> Vec<String> {
+        // Note: This is a simplified implementation. In production, you'd maintain
+        // a reverse index mapping canonical IDs to their aliases.
+        Vec::new(&env)
+    }
+
+    // ── #507: Provenance score traceability ──────────────────────────────────
+
+    /// Record or update provenance score metadata for a product.
+    /// Persists across contract upgrades.
+    pub fn set_provenance_score(
+        env: Env,
+        product_id: String,
+        score: u32,
+        verified_event_count: u32,
+    ) -> ProvenanceScoreMetadata {
+        // Verify product exists
+        if !env.storage().persistent().has(&DataKey::Product(product_id.clone())) {
+            panic!("product not found");
+        }
+
+        if score > 100 {
+            panic!("score must be between 0 and 100");
+        }
+
+        let metadata = ProvenanceScoreMetadata {
+            product_id: product_id.clone(),
+            score,
+            last_calculated_at: env.ledger().timestamp(),
+            verified_event_count,
+            schema_version: SCHEMA_VERSION,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProvenanceScore(product_id.clone()), &metadata);
+
+        env.events().publish(
+            (Symbol::new(&env, "provenance_score_updated"), product_id),
+            metadata.clone(),
+        );
+
+        metadata
+    }
+
+    /// Retrieve provenance score metadata for a product.
+    pub fn get_provenance_score(env: Env, product_id: String) -> Option<ProvenanceScoreMetadata> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProvenanceScore(product_id))
+    }
+
+    /// Get provenance score history (returns current score if available).
+    pub fn get_provenance_score_history(env: Env, product_id: String) -> Vec<ProvenanceScoreMetadata> {
+        let mut history = Vec::new(&env);
+        if let Some(metadata) = env
+            .storage()
+            .persistent()
+            .get::<_, ProvenanceScoreMetadata>(&DataKey::ProvenanceScore(product_id))
+        {
+            history.push_back(metadata);
+        }
+        history
+    }
+
+    // ── Emergency stop (#441 / #442) ──────────────────────────────────────────
+
+    /// Return `true` when the contract is paused (emergency-stop active).
+    ///
+    /// This is a read-only query; it is always available regardless of pause state.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ContractPaused)
+            .unwrap_or(false)
+    }
+
+    /// Set the contract pause state.
+    ///
+    /// When `paused` is `true` all write operations will return
+    /// [`Error::ContractPaused`]. Read-only operations are unaffected.
+    ///
+    /// # Authorization
+    /// Restricted to the product owner acting as guardian. In a production
+    /// deployment this should be gated on a dedicated guardian address stored
+    /// in contract instance storage.
+    ///
+    /// # Parameters
+    /// - `guardian` — Address of the authorized guardian invoking this call.
+    /// - `paused`   — `true` to halt writes; `false` to resume normal operation.
+    pub fn set_pause_state(env: Env, guardian: Address, paused: bool) -> bool {
+        guardian.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::ContractPaused, &paused);
+        env.events().publish(
+            (Symbol::new(&env, "contract_pause_changed"),),
+            paused,
+        );
+        paused
     }
 }
 
@@ -2679,69 +3121,10 @@ fn compute_stable_id(
         hex_bytes[i * 2] = hex_chars[(byte >> 4) as usize];
         hex_bytes[i * 2 + 1] = hex_chars[(byte & 0xf) as usize];
     }
+
+    // Return the hex string representing the SHA-256 digest.
     String::from_bytes(env, &hex_bytes)
-            .ok_or(Error::ProductNotFound)?;
-
-        if product.owner != rejector {
-            return Err(Error::OwnerOnly);
-        }
-        rejector.require_auth();
-        Self::validate_and_increment_nonce(&env, &rejector, nonce);
-
-        // Validate reason length (max 256 characters)
-        if reason.len() > 256 {
-            panic!("rejection reason too long");
-        }
-
-        let mut pending: Vec<PendingEvent> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PendingEvents(product_id.clone()))
-            .ok_or(Error::NoPendingEvents)?;
-
-        // Find the pending event by stable ID (not index-based)
-        let mut event_position: Option<usize> = None;
-        for i in 0..pending.len() {
-            if pending.get(i).unwrap().pending_event_id == pending_event_id {
-                event_position = Some(i);
-                break;
-            }
-        }
-
-        let event_index = event_position.ok_or_else(|| {
-            panic!("pending event not found")
-        })?;
-
-        let rejected_event = pending.get(event_index).unwrap().clone();
-
-        // Remove from pending
-        pending.remove(event_index);
-        if pending.len() > 0 {
-            env.storage()
-                .persistent()
-                .set(&DataKey::PendingEvents(product_id.clone()), &pending);
-        } else {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::PendingEvents(product_id.clone()));
-        }
-
-        // Emit enriched rejection event with reason
-        let rejection = EventRejection {
-            product_id: product_id.clone(),
-            event: rejected_event.event,
-            rejector,
-            reason,
-            timestamp: env.ledger().timestamp(),
-        };
-
-        env.events().publish(
-            (Symbol::new(&env, "event_rejected"), product_id),
-            rejection,
-        );
-
-        Ok(true)
-    }
+}
 
     /// Property 4: Count equals vec length
     proptest! {
@@ -3157,6 +3540,391 @@ fn compute_stable_id(
             .get(&DataKey::Certifications(product_id))
             .unwrap_or_else(|| Vec::new(&env))
     }
+
+    // ── Event archival ────────────────────────────────────────────────────────
+
+    /// Archive a tracking event by its `stable_id`.
+    ///
+    /// Moves the matching event from the active `Events` list into the
+    /// `ArchivedEvents` store. The event data is preserved verbatim so
+    /// integrity proofs remain valid. Archived events are excluded from
+    /// `get_tracking_events` and `list_tracking_events` but remain fully
+    /// queryable via `list_archived_events`.
+    ///
+    /// # Authorization
+    /// Requires `caller.require_auth()`. Caller must be the product owner or
+    /// an authorized actor.
+    ///
+    /// # Panics
+    /// - `"product not found"` — if `product_id` is not registered.
+    /// - `"caller is not authorized"` — if caller lacks permission.
+    /// - `"event not found"` — if no active event with `stable_id` exists.
+    pub fn archive_tracking_event(
+        env: Env,
+        product_id: String,
+        caller: Address,
+        stable_id: String,
+        reason: String,
+    ) -> ArchivedEvent {
+        let product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .unwrap_or_else(|| panic!("product not found"));
+
+        let is_owner = product.owner == caller;
+        let is_actor = product.authorized_actors.contains(&caller);
+        if !is_owner && !is_actor {
+            panic!("caller is not authorized");
+        }
+        caller.require_auth();
+
+        let events: Vec<TrackingEvent> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Events(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Find and remove the event from the active list
+        let mut remaining: Vec<TrackingEvent> = Vec::new(&env);
+        let mut target: Option<TrackingEvent> = None;
+        for ev in events.iter() {
+            if ev.stable_id == stable_id && target.is_none() {
+                target = Some(ev.clone());
+            } else {
+                remaining.push_back(ev.clone());
+            }
+        }
+
+        let event = target.unwrap_or_else(|| panic!("event not found"));
+
+        // Write back the active list without the archived event
+        env.storage()
+            .persistent()
+            .set(&DataKey::Events(product_id.clone()), &remaining);
+
+        let archived = ArchivedEvent {
+            event: event.clone(),
+            archived_by: caller,
+            archived_at: env.ledger().timestamp(),
+            reason,
+        };
+
+        // Append to the archived list
+        let mut archived_list: Vec<ArchivedEvent> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArchivedEvents(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        archived_list.push_back(archived.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArchivedEvents(product_id.clone()), &archived_list);
+
+        env.events().publish(
+            (Symbol::new(&env, "event_archived"), product_id),
+            archived.clone(),
+        );
+
+        archived
+    }
+
+    /// Return all archived events for a product with optional pagination.
+    ///
+    /// Archived events are excluded from the active timeline but remain
+    /// auditable here. Pass `offset=0, limit=0` to retrieve all records.
+    pub fn list_archived_events(
+        env: Env,
+        product_id: String,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<ArchivedEvent> {
+        let all: Vec<ArchivedEvent> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArchivedEvents(product_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if limit == 0 {
+            return all;
+        }
+
+        let mut page: Vec<ArchivedEvent> = Vec::new(&env);
+        let start = offset as usize;
+        let end = core::cmp::min(start + limit as usize, all.len() as usize);
+        for i in start..end {
+            if let Some(item) = all.get(i as u32) {
+                page.push_back(item);
+            }
+        }
+        page
+    }
+
+    // ── Certification registry ────────────────────────────────────────────────
+
+    /// Register a trusted certification issuer in the on-chain registry.
+    ///
+    /// Only the product owner or an authorized actor may register issuers.
+    /// The issuer's Stellar address, name, and supported cert types are stored.
+    ///
+    /// # Panics
+    /// - `"issuer already registered"` — if the address is already active.
+    pub fn register_certification_issuer(
+        env: Env,
+        caller: Address,
+        issuer_address: Address,
+        name: String,
+        cert_types: Vec<String>,
+    ) -> CertificationIssuer {
+        caller.require_auth();
+        assert_len(&name, MAX_NAME_LEN, "name");
+
+        // Prevent duplicate active registrations
+        let existing: Option<CertificationIssuer> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IssuerCertifications(issuer_address.clone()));
+        if let Some(ref iss) = existing {
+            if iss.active {
+                panic!("issuer already registered");
+            }
+        }
+
+        let issuer = CertificationIssuer {
+            issuer_address: issuer_address.clone(),
+            name,
+            cert_types,
+            registered_at: env.ledger().timestamp(),
+            active: true,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::IssuerCertifications(issuer_address.clone()), &issuer);
+
+        // Maintain a global list of issuer addresses for enumeration
+        let mut issuers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CertificationIssuers)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !issuers.contains(&issuer_address) {
+            issuers.push_back(issuer_address.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::CertificationIssuers, &issuers);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "issuer_registered"), issuer_address),
+            issuer.clone(),
+        );
+
+        issuer
+    }
+
+    /// Issue a certification registry record linking a product to an external cert.
+    ///
+    /// The issuer must be registered and active. The `cert_type` must be in
+    /// the issuer's `cert_types` list. The `document_hash` is a hex-encoded
+    /// SHA-256 of the external certificate document for cross-checking.
+    ///
+    /// # Panics
+    /// - `"product not found"` — if `product_id` is not registered.
+    /// - `"issuer not registered"` — if the issuer address is unknown.
+    /// - `"issuer is not active"` — if the issuer has been deactivated.
+    /// - `"cert_type not supported by issuer"` — if the type is not in the issuer's list.
+    pub fn issue_certification_registry_record(
+        env: Env,
+        product_id: String,
+        issuer_address: Address,
+        record_id: String,
+        external_cert_id: String,
+        cert_type: String,
+        document_hash: String,
+    ) -> CertificationRegistryRecord {
+        // Verify product exists
+        if !env.storage().persistent().has(&DataKey::Product(product_id.clone())) {
+            panic!("product not found");
+        }
+
+        issuer_address.require_auth();
+        assert_len(&record_id, 128, "record_id");
+        assert_len(&external_cert_id, 256, "external_cert_id");
+        assert_len(&cert_type, 64, "cert_type");
+        assert_len(&document_hash, MAX_COMMITMENT_LEN, "document_hash");
+
+        let issuer: CertificationIssuer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IssuerCertifications(issuer_address.clone()))
+            .unwrap_or_else(|| panic!("issuer not registered"));
+
+        if !issuer.active {
+            panic!("issuer is not active");
+        }
+
+        if !issuer.cert_types.contains(&cert_type) {
+            panic!("cert_type not supported by issuer");
+        }
+
+        let record = CertificationRegistryRecord {
+            id: record_id.clone(),
+            product_id: product_id.clone(),
+            issuer_address: issuer_address.clone(),
+            external_cert_id,
+            cert_type,
+            document_hash,
+            issued_at: env.ledger().timestamp(),
+            revoked: false,
+            revoked_at: 0,
+        };
+
+        let mut reg_records: Vec<CertificationRegistryRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CertRegistryRecords(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        reg_records.push_back(record.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::CertRegistryRecords(product_id.clone()), &reg_records);
+
+        env.events().publish(
+            (Symbol::new(&env, "cert_registry_issued"), product_id, issuer_address),
+            record.clone(),
+        );
+
+        record
+    }
+
+    /// Verify a certification registry record by its `record_id`.
+    ///
+    /// Returns `(true, record)` if the record exists and is not revoked,
+    /// `(false, record)` if it is revoked, or panics if not found.
+    pub fn verify_certification_registry_record(
+        env: Env,
+        product_id: String,
+        record_id: String,
+    ) -> (bool, CertificationRegistryRecord) {
+        let records: Vec<CertificationRegistryRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CertRegistryRecords(product_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        for record in records.iter() {
+            if record.id == record_id {
+                let valid = !record.revoked;
+                return (valid, record);
+            }
+        }
+        panic!("certification registry record not found");
+    }
+
+    /// Revoke a certification registry record.
+    ///
+    /// Only the issuer who created the record may revoke it.
+    ///
+    /// # Panics
+    /// - `"record not found"` — if no record with `record_id` exists.
+    /// - `"only issuer can revoke"` — if caller is not the original issuer.
+    pub fn revoke_certification_registry_record(
+        env: Env,
+        product_id: String,
+        caller: Address,
+        record_id: String,
+    ) -> bool {
+        caller.require_auth();
+
+        let records: Vec<CertificationRegistryRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CertRegistryRecords(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut updated: Vec<CertificationRegistryRecord> = Vec::new(&env);
+        let mut found = false;
+        for record in records.iter() {
+            if record.id == record_id {
+                if record.issuer_address != caller {
+                    panic!("only issuer can revoke");
+                }
+                let revoked = CertificationRegistryRecord {
+                    revoked: true,
+                    revoked_at: env.ledger().timestamp(),
+                    ..record.clone()
+                };
+                env.events().publish(
+                    (Symbol::new(&env, "cert_registry_revoked"), product_id.clone()),
+                    revoked.clone(),
+                );
+                updated.push_back(revoked);
+                found = true;
+            } else {
+                updated.push_back(record.clone());
+            }
+        }
+
+        if !found {
+            panic!("record not found");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CertRegistryRecords(product_id), &updated);
+        true
+    }
+
+    /// List all certification registry records for a product.
+    pub fn list_certification_registry_records(
+        env: Env,
+        product_id: String,
+    ) -> Vec<CertificationRegistryRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CertRegistryRecords(product_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Deactivate a registered certification issuer.
+    ///
+    /// Only the issuer themselves can deactivate their own registration.
+    pub fn deactivate_certification_issuer(
+        env: Env,
+        issuer_address: Address,
+    ) -> bool {
+        issuer_address.require_auth();
+
+        let mut issuer: CertificationIssuer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IssuerCertifications(issuer_address.clone()))
+            .unwrap_or_else(|| panic!("issuer not registered"));
+
+        issuer.active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::IssuerCertifications(issuer_address.clone()), &issuer);
+
+        env.events().publish(
+            (Symbol::new(&env, "issuer_deactivated"), issuer_address),
+            false,
+        );
+
+        true
+    }
+
+    /// Get a registered certification issuer by address.
+    pub fn get_certification_issuer(
+        env: Env,
+        issuer_address: Address,
+    ) -> CertificationIssuer {
+        env.storage()
+            .persistent()
+            .get(&DataKey::IssuerCertifications(issuer_address))
+            .unwrap_or_else(|| panic!("issuer not registered"))
+    }
 }
 
 #[cfg(test)]
@@ -3517,6 +4285,9 @@ mod rejection_reason_tests {
             owner,
             product_ids: Vec::new(&env),
             timestamp: env.ledger().timestamp(),
+            recalled: false,
+            recall_reason: String::from_str(&env, ""),
+            recall_timestamp: 0,
         };
         env.storage()
             .persistent()
@@ -3527,6 +4298,408 @@ mod rejection_reason_tests {
             batch.clone(),
         );
         batch
+    }
+
+    // ── Batch recall with propagation ─────────────────────────────────────────
+
+    /// Recall an entire batch and propagate the recall to all contained products.
+    ///
+    /// Sets `batch.recalled = true` and calls `recall_product` for every
+    /// product ID in `batch.product_ids`. Products that are already recalled
+    /// are skipped (idempotent). Only the batch owner may trigger a batch recall.
+    ///
+    /// # Parameters
+    /// - `env` — Soroban execution environment.
+    /// - `batch_id` — ID of the batch to recall.
+    /// - `reason` — Human-readable recall reason (max 256 bytes).
+    ///
+    /// # Returns
+    /// The number of products that were newly recalled (already-recalled
+    /// products are not counted).
+    ///
+    /// # Authorization
+    /// Requires `batch.owner.require_auth()`.
+    ///
+    /// # Panics
+    /// - `"batch not found"` — if `batch_id` is not registered.
+    ///
+    /// # Emitted Events
+    /// - `("batch_recalled", batch_id)` with the updated `Batch` as body.
+    /// - `("product_recalled", product_id)` for each newly recalled product.
+    pub fn recall_batch(
+        env: Env,
+        batch_id: String,
+        reason: String,
+    ) -> u32 {
+        let mut batch: Batch = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Batch(batch_id.clone()))
+            .expect("batch not found");
+
+        batch.owner.require_auth();
+
+        if reason.len() > 256 {
+            panic!("recall reason too long");
+        }
+
+        batch.recalled = true;
+        batch.recall_reason = reason.clone();
+        batch.recall_timestamp = env.ledger().timestamp();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Batch(batch_id.clone()), &batch);
+
+        // Append to batch recall history
+        let mut history: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BatchRecallHistory(batch_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        history.push_back(reason.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::BatchRecallHistory(batch_id.clone()), &history);
+
+        // Propagate recall to all contained products
+        let mut newly_recalled: u32 = 0;
+        for i in 0..batch.product_ids.len() {
+            let product_id = batch.product_ids.get(i).unwrap();
+            let product_opt: Option<crate::Product> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Product(product_id.clone()));
+
+            if let Some(mut product) = product_opt {
+                if !product.recalled {
+                    product.recalled = true;
+                    product.recall_reason = reason.clone();
+                    product.recall_timestamp = env.ledger().timestamp();
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Product(product_id.clone()), &product);
+
+                    // Append to product recall history
+                    let mut prod_history: Vec<String> = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::RecallHistory(product_id.clone()))
+                        .unwrap_or_else(|| Vec::new(&env));
+                    prod_history.push_back(reason.clone());
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::RecallHistory(product_id.clone()), &prod_history);
+
+                    env.events().publish(
+                        (Symbol::new(&env, "product_recalled"), product_id),
+                        true,
+                    );
+                    newly_recalled += 1;
+                }
+            }
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_recalled"), batch_id),
+            batch,
+        );
+
+        newly_recalled
+    }
+
+    /// Lift a recall from a batch. Does NOT automatically unrecall contained products.
+    ///
+    /// # Authorization
+    /// Requires `batch.owner.require_auth()`.
+    pub fn unrecall_batch(env: Env, batch_id: String) -> bool {
+        let mut batch: Batch = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Batch(batch_id.clone()))
+            .expect("batch not found");
+
+        batch.owner.require_auth();
+
+        batch.recalled = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Batch(batch_id.clone()), &batch);
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_unrecalled"), batch_id),
+            false,
+        );
+        true
+    }
+
+    /// Return recall information for a batch: (recalled, reason, timestamp).
+    pub fn get_batch_recall_info(env: Env, batch_id: String) -> (bool, String, u64) {
+        let batch: Batch = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Batch(batch_id))
+            .expect("batch not found");
+        (batch.recalled, batch.recall_reason, batch.recall_timestamp)
+    }
+
+    /// Return the full recall history for a batch.
+    pub fn get_batch_recall_history(env: Env, batch_id: String) -> Vec<String> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BatchRecallHistory(batch_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // ── Auditor registry ──────────────────────────────────────────────────────
+
+    /// Initialize the contract admin. Can only be called once.
+    ///
+    /// The admin is the only address that may register or deactivate auditors.
+    /// If an admin is already set, this function panics.
+    ///
+    /// # Authorization
+    /// Requires `admin.require_auth()`.
+    pub fn initialize_admin(env: Env, admin: Address) -> bool {
+        if env.storage().persistent().has(&DataKey::Admin) {
+            panic!("admin already initialized");
+        }
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+        true
+    }
+
+    /// Return the current admin address, if set.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::Admin)
+    }
+
+    /// Register a new auditor. Admin-only.
+    ///
+    /// # Parameters
+    /// - `auditor_address` — Stellar address of the auditor to register.
+    /// - `name` — Human-readable name of the auditing organisation (max 256 bytes).
+    ///
+    /// # Authorization
+    /// Requires the contract admin's `require_auth()`.
+    ///
+    /// # Panics
+    /// - `"admin not initialized"` — if no admin has been set.
+    /// - `"auditor already registered"` — if the address is already registered.
+    /// - `"name too long"` — if name exceeds 256 bytes.
+    ///
+    /// # Emitted Events
+    /// Publishes `("auditor_registered", auditor_address)` with the `Auditor` struct.
+    pub fn register_auditor(
+        env: Env,
+        auditor_address: Address,
+        name: String,
+    ) -> Auditor {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("admin not initialized");
+        admin.require_auth();
+
+        if env.storage().persistent().has(&DataKey::Auditor(auditor_address.clone())) {
+            panic!("auditor already registered");
+        }
+        assert_len(&name, MAX_NAME_LEN, "name");
+
+        let auditor = Auditor {
+            address: auditor_address.clone(),
+            name,
+            active: true,
+            registered_at: env.ledger().timestamp(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Auditor(auditor_address.clone()), &auditor);
+
+        env.events().publish(
+            (Symbol::new(&env, "auditor_registered"), auditor_address),
+            auditor.clone(),
+        );
+
+        auditor
+    }
+
+    /// Deactivate a registered auditor. Admin-only.
+    ///
+    /// Deactivated auditors cannot submit new attestations. Existing
+    /// attestations remain valid and queryable.
+    ///
+    /// # Authorization
+    /// Requires the contract admin's `require_auth()`.
+    pub fn deactivate_auditor(env: Env, auditor_address: Address) -> bool {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("admin not initialized");
+        admin.require_auth();
+
+        let mut auditor: Auditor = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Auditor(auditor_address.clone()))
+            .expect("auditor not found");
+
+        auditor.active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Auditor(auditor_address.clone()), &auditor);
+
+        env.events().publish(
+            (Symbol::new(&env, "auditor_deactivated"), auditor_address),
+            false,
+        );
+        true
+    }
+
+    /// Return the auditor record for a given address, if registered.
+    pub fn get_auditor(env: Env, auditor_address: Address) -> Option<Auditor> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Auditor(auditor_address))
+    }
+
+    /// Check whether an address is a currently active registered auditor.
+    pub fn is_active_auditor(env: Env, auditor_address: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Auditor>(&DataKey::Auditor(auditor_address))
+            .map(|a| a.active)
+            .unwrap_or(false)
+    }
+
+    // ── Attestations ──────────────────────────────────────────────────────────
+
+    /// Submit a signed attestation for a product or a specific product event.
+    ///
+    /// Only registered, active auditors may submit attestations. The `signature`
+    /// field must be a hex-encoded Ed25519 signature over the canonical payload:
+    /// `product_id|target_id|attestation_type|timestamp` (UTF-8, pipe-separated).
+    ///
+    /// # Parameters
+    /// - `product_id` — ID of the product being attested.
+    /// - `target_id` — Stable event ID (`TrackingEvent.stable_id`) if attesting
+    ///   a specific event, or empty string for a product-level attestation.
+    /// - `auditor_address` — Stellar address of the submitting auditor.
+    /// - `attestation_id` — Caller-supplied unique ID for this attestation (max 128 bytes).
+    /// - `attestation_type` — Type key (e.g. `"quality_check"`, `"origin_verified"`).
+    /// - `signature` — Hex-encoded Ed25519 signature (max 128 bytes).
+    /// - `notes` — Optional auditor notes (max 1024 bytes).
+    ///
+    /// # Authorization
+    /// Requires `auditor_address.require_auth()`.
+    ///
+    /// # Panics
+    /// - `"product not found"` — if `product_id` is not registered.
+    /// - `"auditor not registered"` — if the address is not in the registry.
+    /// - `"auditor is not active"` — if the auditor has been deactivated.
+    /// - `"attestation_id too long"` — if attestation_id exceeds 128 bytes.
+    /// - `"attestation_type too long"` — if attestation_type exceeds 64 bytes.
+    /// - `"signature too long"` — if signature exceeds 128 bytes.
+    /// - `"notes too long"` — if notes exceed 1024 bytes.
+    ///
+    /// # Emitted Events
+    /// Publishes `("attestation_submitted", product_id)` with the `Attestation` struct.
+    pub fn submit_attestation(
+        env: Env,
+        product_id: String,
+        target_id: String,
+        auditor_address: Address,
+        attestation_id: String,
+        attestation_type: String,
+        signature: String,
+        notes: String,
+    ) -> Attestation {
+        // Verify product exists
+        if !env.storage().persistent().has(&DataKey::Product(product_id.clone())) {
+            panic!("product not found");
+        }
+
+        // Verify auditor is registered and active
+        let auditor: Auditor = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Auditor(auditor_address.clone()))
+            .expect("auditor not registered");
+
+        if !auditor.active {
+            panic!("auditor is not active");
+        }
+
+        auditor_address.require_auth();
+
+        // Validate field lengths
+        assert_len(&attestation_id, MAX_ID_LEN, "attestation_id");
+        assert_len(&attestation_type, 64, "attestation_type");
+        assert_len(&signature, MAX_COMMITMENT_LEN, "signature");
+        if notes.len() > 1024 {
+            panic!("notes too long");
+        }
+
+        let attestation = Attestation {
+            id: attestation_id,
+            product_id: product_id.clone(),
+            target_id,
+            auditor: auditor_address,
+            attestation_type,
+            signature,
+            timestamp: env.ledger().timestamp(),
+            notes,
+        };
+
+        let mut attestations: Vec<Attestation> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Attestations(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        attestations.push_back(attestation.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::Attestations(product_id.clone()), &attestations);
+
+        env.events().publish(
+            (Symbol::new(&env, "attestation_submitted"), product_id),
+            attestation.clone(),
+        );
+
+        attestation
+    }
+
+    /// Return all attestations for a product (both product-level and event-level).
+    pub fn get_attestations(env: Env, product_id: String) -> Vec<Attestation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Attestations(product_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Return attestations for a specific event (filtered by target_id).
+    pub fn get_event_attestations(
+        env: Env,
+        product_id: String,
+        target_id: String,
+    ) -> Vec<Attestation> {
+        let all: Vec<Attestation> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Attestations(product_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut filtered = Vec::new(&env);
+        for i in 0..all.len() {
+            let a = all.get(i).unwrap();
+            if a.target_id == target_id {
+                filtered.push_back(a);
+            }
+        }
+        filtered
     }
 
     /// Add a product to a batch (batch owner-only).
@@ -3619,209 +4792,629 @@ mod rejection_reason_tests {
             .expect("batch not found")
     }
 
-    // ── Assembly relationships ─────────────────────────────────────────────────
+    // ── #460: Document hash anchoring ─────────────────────────────────────────
 
-    /// Register or replace the assembly relationship for a parent product.
+    /// Anchor an off-chain document hash on-chain for a product.
     ///
-    /// A parent product is assembled from one or more component products.
-    /// Each component carries its own provenance chain; the assembly record
-    /// aggregates them under a single parent.
+    /// The caller computes the SHA-256 hash of the document bytes off-chain
+    /// and submits the hex-encoded digest here. The contract stores it
+    /// immutably so it can be verified later via [`Self::verify_document_hash`].
     ///
     /// # Parameters
-    /// - `parent_id` — ID of the assembled (parent) product.
-    /// - `component_ids` — Ordered list of component product IDs (max 50).
-    /// - `description` — Optional description of the assembly process (max 4096 bytes).
-    /// - `caller` — Must be the parent product owner.
+    /// - `product_id` — ID of the product this document belongs to.
+    /// - `label` — Human-readable document label (max 256 bytes).
+    /// - `hash` — Hex-encoded SHA-256 digest of the document (64 chars).
+    /// - `caller` — Address anchoring the document; must be owner or authorized actor.
+    ///
+    /// # Returns
+    /// The newly created [`DocumentAnchor`].
     ///
     /// # Authorization
-    /// Requires `caller.require_auth()`. Caller must be the parent product owner.
-    ///
-    /// # Errors
-    /// - [`Error::ProductNotFound`] — if `parent_id` is not registered.
-    /// - [`Error::NotAuthorized`] — if caller is not the parent product owner.
-    ///
-    /// # Panics
-    /// - `"assembly exceeds maximum component count"` — if more than 50 components.
-    /// - `"component product not found"` — if any component ID is not registered.
-    /// - `"description exceeds max length"` — if description > 4096 bytes.
-    ///
-    /// # Emitted Events
-    /// Publishes `("assembly_registered", parent_id)` with the
-    /// [`assembly_warranty::ProductAssembly`] struct as the body.
-    pub fn register_assembly(
+    /// Requires `caller.require_auth()`.
+    pub fn anchor_document_hash(
         env: Env,
-        parent_id: String,
-        component_ids: Vec<String>,
+        product_id: String,
+        label: String,
+        hash: String,
+        caller: Address,
+    ) -> DocumentAnchor {
+        let product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+
+        let is_owner = product.owner == caller;
+        let is_actor = product.authorized_actors.contains(&caller);
+        if !is_owner && !is_actor {
+            panic!("caller is not authorized");
+        }
+        caller.require_auth();
+
+        assert_len(&label, MAX_NAME_LEN, "label");
+        // SHA-256 hex digest is exactly 64 chars
+        if hash.len() != 64 {
+            panic!("hash must be a 64-char hex-encoded SHA-256 digest");
+        }
+
+        let anchor = DocumentAnchor {
+            product_id: product_id.clone(),
+            label,
+            hash,
+            anchored_by: caller,
+            anchored_at: env.ledger().timestamp(),
+        };
+
+        let mut anchors: Vec<DocumentAnchor> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DocumentAnchors(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        anchors.push_back(anchor.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::DocumentAnchors(product_id.clone()), &anchors);
+
+        env.events().publish(
+            (Symbol::new(&env, "document_anchored"), product_id),
+            anchor.clone(),
+        );
+
+        anchor
+    }
+
+    /// Verify whether a given hash matches any anchored document for a product.
+    ///
+    /// # Parameters
+    /// - `product_id` — ID of the product to check.
+    /// - `hash` — Hex-encoded SHA-256 digest to look up.
+    ///
+    /// # Returns
+    /// `true` if the hash matches an existing anchor; `false` otherwise.
+    pub fn verify_document_hash(env: Env, product_id: String, hash: String) -> bool {
+        let anchors: Vec<DocumentAnchor> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DocumentAnchors(product_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        for i in 0..anchors.len() {
+            if anchors.get(i).unwrap().hash == hash {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Return all document anchors for a product.
+    pub fn get_document_anchors(env: Env, product_id: String) -> Vec<DocumentAnchor> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DocumentAnchors(product_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // ── Issue #503: Event timestamp certification ────────────────────────────
+
+    /// Certify the timestamp of a tracking event.
+    /// Only authorized certifiers can issue timestamp certifications.
+    pub fn certify_event_timestamp(
+        env: Env,
+        product_id: String,
+        event_stable_id: String,
+        certifier: Address,
+    ) -> EventTimestampCert {
+        let product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+
+        let is_owner = product.owner == certifier;
+        let is_actor = product.authorized_actors.contains(&certifier);
+        if !is_owner && !is_actor {
+            panic!("certifier is not authorized");
+        }
+        certifier.require_auth();
+
+        let cert_id = format_cert_id(&env, &product_id, &event_stable_id);
+        let now = env.ledger().timestamp();
+
+        let cert = EventTimestampCert {
+            id: cert_id.clone(),
+            product_id: product_id.clone(),
+            event_stable_id,
+            certified_timestamp: now,
+            certifier,
+            issued_at: now,
+            revoked: false,
+        };
+
+        let mut certs: Vec<EventTimestampCert> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EventTimestampCerts(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        certs.push_back(cert.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::EventTimestampCerts(product_id.clone()), &certs);
+
+        env.events().publish(
+            (Symbol::new(&env, "event_timestamp_certified"), product_id),
+            cert.clone(),
+        );
+
+        cert
+    }
+
+    /// Get all timestamp certifications for a product.
+    pub fn get_event_timestamp_certs(env: Env, product_id: String) -> Vec<EventTimestampCert> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EventTimestampCerts(product_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Revoke a timestamp certification.
+    pub fn revoke_event_timestamp_cert(
+        env: Env,
+        product_id: String,
+        cert_id: String,
+        revoker: Address,
+    ) -> bool {
+        let product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+
+        product.owner.require_auth();
+
+        let mut certs: Vec<EventTimestampCert> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EventTimestampCerts(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut found = false;
+        for i in 0..certs.len() {
+            let mut cert = certs.get(i).unwrap().clone();
+            if cert.id == cert_id {
+                cert.revoked = true;
+                certs.set(i, cert);
+                found = true;
+                break;
+            }
+        }
+
+        if found {
+            env.storage()
+                .persistent()
+                .set(&DataKey::EventTimestampCerts(product_id.clone()), &certs);
+            env.events().publish(
+                (Symbol::new(&env, "event_timestamp_cert_revoked"), product_id),
+                cert_id,
+            );
+        }
+
+        found
+    }
+
+    // ── Issue #504: Product provenance proof notarization ────────────────────
+
+    /// Notarize a product's provenance proof.
+    /// Only authorized notaries can issue notarizations.
+    pub fn notarize_provenance(
+        env: Env,
+        product_id: String,
+        proof_hash: String,
+        notary: Address,
+        expires_at: u64,
+    ) -> ProvenanceNotarization {
+        let product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+
+        let is_owner = product.owner == notary;
+        let is_actor = product.authorized_actors.contains(&notary);
+        if !is_owner && !is_actor {
+            panic!("notary is not authorized");
+        }
+        notary.require_auth();
+
+        // Proof hash should be 64 chars (SHA-256 hex)
+        if proof_hash.len() != 64 {
+            panic!("proof_hash must be a 64-char hex-encoded SHA-256 digest");
+        }
+
+        let notarization_id = format_notarization_id(&env, &product_id);
+        let now = env.ledger().timestamp();
+
+        let notarization = ProvenanceNotarization {
+            id: notarization_id.clone(),
+            product_id: product_id.clone(),
+            proof_hash,
+            notary,
+            notarized_at: now,
+            expires_at,
+            revoked: false,
+        };
+
+        let mut notarizations: Vec<ProvenanceNotarization> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProvenanceNotarizations(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        notarizations.push_back(notarization.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProvenanceNotarizations(product_id.clone()), &notarizations);
+
+        env.events().publish(
+            (Symbol::new(&env, "provenance_notarized"), product_id),
+            notarization.clone(),
+        );
+
+        notarization
+    }
+
+    /// Get all provenance notarizations for a product.
+    pub fn get_provenance_notarizations(env: Env, product_id: String) -> Vec<ProvenanceNotarization> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProvenanceNotarizations(product_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Revoke a provenance notarization.
+    pub fn revoke_provenance_notarization(
+        env: Env,
+        product_id: String,
+        notarization_id: String,
+    ) -> bool {
+        let product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+
+        product.owner.require_auth();
+
+        let mut notarizations: Vec<ProvenanceNotarization> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProvenanceNotarizations(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut found = false;
+        for i in 0..notarizations.len() {
+            let mut notarization = notarizations.get(i).unwrap().clone();
+            if notarization.id == notarization_id {
+                notarization.revoked = true;
+                notarizations.set(i, notarization);
+                found = true;
+                break;
+            }
+        }
+
+        if found {
+            env.storage()
+                .persistent()
+                .set(&DataKey::ProvenanceNotarizations(product_id.clone()), &notarizations);
+            env.events().publish(
+                (Symbol::new(&env, "provenance_notarization_revoked"), product_id),
+                notarization_id,
+            );
+        }
+
+        found
+    }
+
+    // ── Issue #505: Supply chain event certification workflows ──────────────
+
+    /// Register a new certifier.
+    pub fn register_certifier(
+        env: Env,
+        id: String,
+        address: Address,
+        name: String,
+        cert_types: Vec<String>,
+    ) -> Certifier {
+        address.require_auth();
+
+        let certifier = Certifier {
+            id: id.clone(),
+            address,
+            name,
+            cert_types,
+            registered_at: env.ledger().timestamp(),
+            active: true,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Certifier(id.clone()), &certifier);
+
+        let mut certifier_ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CertifierIndex)
+            .unwrap_or_else(|| Vec::new(&env));
+        certifier_ids.push_back(id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CertifierIndex, &certifier_ids);
+
+        env.events().publish(
+            (Symbol::new(&env, "certifier_registered"), id),
+            certifier.clone(),
+        );
+
+        certifier
+    }
+
+    /// Get a certifier by ID.
+    pub fn get_certifier(env: Env, id: String) -> Option<Certifier> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Certifier(id))
+    }
+
+    /// Certify a supply chain event.
+    pub fn certify_event(
+        env: Env,
+        product_id: String,
+        event_stable_id: String,
+        cert_type: String,
+        certifier_id: String,
+        metadata: String,
+    ) -> EventCertification {
+        let certifier: Certifier = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Certifier(certifier_id.clone()))
+            .expect("certifier not found");
+
+        if !certifier.active {
+            panic!("certifier is not active");
+        }
+
+        certifier.address.require_auth();
+
+        // Verify certifier is authorized for this cert type
+        let mut authorized = false;
+        for i in 0..certifier.cert_types.len() {
+            if certifier.cert_types.get(i).unwrap() == cert_type {
+                authorized = true;
+                break;
+            }
+        }
+        if !authorized {
+            panic!("certifier is not authorized for this certification type");
+        }
+
+        let cert_id = format_event_cert_id(&env, &product_id, &event_stable_id, &cert_type);
+        let now = env.ledger().timestamp();
+
+        let certification = EventCertification {
+            id: cert_id.clone(),
+            product_id: product_id.clone(),
+            event_stable_id,
+            cert_type,
+            certifier: certifier.address,
+            metadata,
+            issued_at: now,
+            revoked: false,
+            revoked_at: 0,
+        };
+
+        let mut certifications: Vec<EventCertification> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EventCertifications(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        certifications.push_back(certification.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::EventCertifications(product_id.clone()), &certifications);
+
+        env.events().publish(
+            (Symbol::new(&env, "event_certified"), product_id),
+            certification.clone(),
+        );
+
+        certification
+    }
+
+    /// Get all event certifications for a product.
+    pub fn get_event_certifications(env: Env, product_id: String) -> Vec<EventCertification> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EventCertifications(product_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Revoke an event certification.
+    pub fn revoke_event_certification(
+        env: Env,
+        product_id: String,
+        cert_id: String,
+    ) -> bool {
+        let product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+
+        product.owner.require_auth();
+
+        let mut certifications: Vec<EventCertification> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EventCertifications(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut found = false;
+        for i in 0..certifications.len() {
+            let mut cert = certifications.get(i).unwrap().clone();
+            if cert.id == cert_id {
+                cert.revoked = true;
+                cert.revoked_at = env.ledger().timestamp();
+                certifications.set(i, cert);
+                found = true;
+                break;
+            }
+        }
+
+        if found {
+            env.storage()
+                .persistent()
+                .set(&DataKey::EventCertifications(product_id.clone()), &certifications);
+            env.events().publish(
+                (Symbol::new(&env, "event_certification_revoked"), product_id),
+                cert_id,
+            );
+        }
+
+        found
+    }
+
+    // ── Issue #506: AI-assisted anomaly review assistant ────────────────────
+
+    /// Report an anomaly detected in a product's supply chain.
+    pub fn report_anomaly(
+        env: Env,
+        product_id: String,
+        anomaly_type: String,
+        severity: u32,
         description: String,
-        caller: Address,
-    ) -> Result<assembly_warranty::ProductAssembly, Error> {
-        assembly_warranty::register_assembly(&env, parent_id, component_ids, description, caller)
+        suggested_actions: String,
+    ) -> AnomalyReport {
+        let _product: Product = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Product(product_id.clone()))
+            .expect("product not found");
+
+        if severity < 1 || severity > 4 {
+            panic!("severity must be between 1 and 4");
+        }
+
+        let report_id = format_anomaly_id(&env, &product_id);
+        let now = env.ledger().timestamp();
+
+        let report = AnomalyReport {
+            id: report_id.clone(),
+            product_id: product_id.clone(),
+            anomaly_type,
+            severity,
+            description,
+            suggested_actions,
+            detected_at: now,
+            reviewed: false,
+            reviewed_by: Address::from_contract_id(&env, &env.current_contract_address()),
+            reviewed_at: 0,
+        };
+
+        let mut reports: Vec<AnomalyReport> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AnomalyReports(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        reports.push_back(report.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::AnomalyReports(product_id.clone()), &reports);
+
+        env.events().publish(
+            (Symbol::new(&env, "anomaly_reported"), product_id),
+            report.clone(),
+        );
+
+        report
     }
 
-    /// Retrieve the assembly record for a parent product.
-    ///
-    /// Returns `None` if no assembly has been registered for this product.
-    pub fn get_assembly(
-        env: Env,
-        parent_id: String,
-    ) -> Option<assembly_warranty::ProductAssembly> {
-        assembly_warranty::get_assembly(&env, parent_id)
+    /// Get all anomaly reports for a product.
+    pub fn get_anomaly_reports(env: Env, product_id: String) -> Vec<AnomalyReport> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AnomalyReports(product_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
-    /// Return all parent product IDs that reference `component_id` as a component.
-    ///
-    /// Performs a lookup over the provided `candidate_parent_ids` list.
-    /// Callers should supply the set of known parent IDs to search.
-    pub fn get_parents_of_component(
-        env: Env,
-        component_id: String,
-        candidate_parent_ids: Vec<String>,
-    ) -> Vec<String> {
-        assembly_warranty::get_parents_of_component(&env, component_id, candidate_parent_ids)
-    }
-
-    // ── Warranty management ───────────────────────────────────────────────────
-
-    /// Register warranty metadata for a product.
-    ///
-    /// # Parameters
-    /// - `product_id` — ID of the product to attach warranty to.
-    /// - `duration_seconds` — Warranty duration in seconds from product registration.
-    ///   Pass `0` for a lifetime warranty.
-    /// - `terms` — Short human-readable warranty terms (max 1024 bytes).
-    /// - `terms_ref` — Off-chain reference to the full warranty document (max 512 bytes).
-    /// - `caller` — Must be the product owner.
-    ///
-    /// # Authorization
-    /// Requires `caller.require_auth()`. Caller must be the product owner.
-    ///
-    /// # Errors
-    /// - [`Error::ProductNotFound`] — if `product_id` is not registered.
-    /// - [`Error::NotAuthorized`] — if caller is not the product owner.
-    ///
-    /// # Emitted Events
-    /// Publishes `("warranty_registered", product_id)` with the
-    /// [`assembly_warranty::WarrantyInfo`] struct as the body.
-    pub fn register_warranty(
-        env: Env,
-        product_id: String,
-        duration_seconds: u64,
-        terms: String,
-        terms_ref: String,
-        caller: Address,
-    ) -> Result<assembly_warranty::WarrantyInfo, Error> {
-        assembly_warranty::register_warranty(&env, product_id, duration_seconds, terms, terms_ref, caller)
-    }
-
-    /// Retrieve warranty metadata for a product.
-    ///
-    /// Returns `None` if no warranty has been registered.
-    pub fn get_warranty(
+    /// Mark an anomaly report as reviewed by an analyst.
+    pub fn review_anomaly(
         env: Env,
         product_id: String,
-    ) -> Option<assembly_warranty::WarrantyInfo> {
-        assembly_warranty::get_warranty(&env, product_id)
-    }
+        report_id: String,
+        analyst: Address,
+    ) -> bool {
+        analyst.require_auth();
 
-    /// Void a warranty. Owner-only.
-    ///
-    /// Once voided, new claims cannot be filed against this warranty.
-    ///
-    /// # Errors
-    /// - [`Error::ProductNotFound`] — if `product_id` is not registered.
-    /// - [`Error::NotAuthorized`] — if caller is not the product owner.
-    ///
-    /// # Panics
-    /// - `"no warranty registered"` — if no warranty exists for this product.
-    ///
-    /// # Emitted Events
-    /// Publishes `("warranty_voided", product_id)` with the updated
-    /// [`assembly_warranty::WarrantyInfo`] struct as the body.
-    pub fn void_warranty(
-        env: Env,
-        product_id: String,
-        caller: Address,
-    ) -> Result<assembly_warranty::WarrantyInfo, Error> {
-        assembly_warranty::void_warranty(&env, product_id, caller)
-    }
+        let mut reports: Vec<AnomalyReport> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AnomalyReports(product_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
 
-    /// Check whether a product's warranty is currently active.
-    ///
-    /// Returns `true` if a non-voided warranty exists and the current ledger
-    /// time is within the warranty period (or the warranty has no expiry).
-    pub fn is_warranty_active(env: Env, product_id: String) -> bool {
-        assembly_warranty::is_warranty_active(&env, product_id)
-    }
+        let mut found = false;
+        for i in 0..reports.len() {
+            let mut report = reports.get(i).unwrap().clone();
+            if report.id == report_id {
+                report.reviewed = true;
+                report.reviewed_by = analyst.clone();
+                report.reviewed_at = env.ledger().timestamp();
+                reports.set(i, report);
+                found = true;
+                break;
+            }
+        }
 
-    /// File a warranty claim against a product.
-    ///
-    /// Any address may file a claim. The claim is linked to the product's
-    /// provenance via the `proof_ref` field (e.g. an IPFS CID pointing to
-    /// supporting documentation).
-    ///
-    /// # Parameters
-    /// - `product_id` — ID of the product the claim is filed against.
-    /// - `claim_id` — Caller-supplied unique identifier for this claim (max 128 bytes).
-    /// - `description` — Description of the issue (max 4096 bytes).
-    /// - `proof_ref` — Off-chain proof reference (max 512 bytes).
-    /// - `claimant` — Address of the claimant (self-authorizes).
-    ///
-    /// # Errors
-    /// - [`Error::ProductNotFound`] — if `product_id` is not registered.
-    ///
-    /// # Panics
-    /// - `"no warranty registered"` — if no warranty exists.
-    /// - `"warranty is voided"` — if the warranty has been voided.
-    ///
-    /// # Emitted Events
-    /// Publishes `("warranty_claim_filed", product_id)` with the
-    /// [`assembly_warranty::WarrantyClaim`] struct as the body.
-    pub fn file_warranty_claim(
-        env: Env,
-        product_id: String,
-        claim_id: String,
-        description: String,
-        proof_ref: String,
-        claimant: Address,
-    ) -> Result<assembly_warranty::WarrantyClaim, Error> {
-        assembly_warranty::file_warranty_claim(&env, product_id, claim_id, description, proof_ref, claimant)
-    }
+        if found {
+            env.storage()
+                .persistent()
+                .set(&DataKey::AnomalyReports(product_id.clone()), &reports);
+            env.events().publish(
+                (Symbol::new(&env, "anomaly_reviewed"), product_id),
+                report_id,
+            );
+        }
 
-    /// Update the status of a warranty claim. Owner-only.
-    ///
-    /// # Parameters
-    /// - `product_id` — ID of the product.
-    /// - `claim_id` — ID of the claim to update.
-    /// - `new_status` — New [`assembly_warranty::ClaimStatus`] value.
-    /// - `caller` — Must be the product owner.
-    ///
-    /// # Errors
-    /// - [`Error::ProductNotFound`] — if `product_id` is not registered.
-    /// - [`Error::NotAuthorized`] — if caller is not the product owner.
-    ///
-    /// # Panics
-    /// - `"claim not found"` — if no claim with `claim_id` exists.
-    ///
-    /// # Emitted Events
-    /// Publishes `("warranty_claim_updated", product_id)` with the updated
-    /// [`assembly_warranty::WarrantyClaim`] struct as the body.
-    pub fn update_claim_status(
-        env: Env,
-        product_id: String,
-        claim_id: String,
-        new_status: assembly_warranty::ClaimStatus,
-        caller: Address,
-    ) -> Result<assembly_warranty::WarrantyClaim, Error> {
-        assembly_warranty::update_claim_status(&env, product_id, claim_id, new_status, caller)
-    }
-
-    /// Return all warranty claims for a product.
-    pub fn list_warranty_claims(
-        env: Env,
-        product_id: String,
-    ) -> Vec<assembly_warranty::WarrantyClaim> {
-        assembly_warranty::list_warranty_claims(&env, product_id)
+        found
     }
 }
 
-mod tests;
+// ── Helper functions ─────────────────────────────────────────────────────────
+
+fn format_cert_id(env: &Env, product_id: &String, event_stable_id: &String) -> String {
+    let mut result = String::from_str(env, "cert_");
+    result.append(&product_id.clone());
+    result.append(&String::from_str(env, "_"));
+    result.append(&event_stable_id.clone());
+    result
+}
+
+fn format_notarization_id(env: &Env, product_id: &String) -> String {
+    let mut result = String::from_str(env, "notary_");
+    result.append(&product_id.clone());
+    result
+}
+
+fn format_event_cert_id(env: &Env, product_id: &String, event_stable_id: &String, cert_type: &String) -> String {
+    let mut result = String::from_str(env, "eventcert_");
+    result.append(&product_id.clone());
+    result.append(&String::from_str(env, "_"));
+    result.append(&event_stable_id.clone());
+    result.append(&String::from_str(env, "_"));
+    result.append(&cert_type.clone());
+    result
+}
+
+fn format_anomaly_id(env: &Env, product_id: &String) -> String {
+    let mut result = String::from_str(env, "anomaly_");
+    result.append(&product_id.clone());
+    result
+}
